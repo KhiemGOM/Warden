@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "serverlimits",
+  "version": "${version}",
+  "name": "ServerLimits",
+  "description": "Configurable explosion power limits and per-player item caps.",
+  "authors": [],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.serverlimits.ServerLimitsMod"]
+  },
+  "mixins": ["serverlimits.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "fabric-api": "*",
+    "minecraft": "~1.21.11"
+  }
+}

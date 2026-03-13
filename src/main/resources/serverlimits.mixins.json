@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "package": "com.serverlimits.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ExplosionMixin"
+  ],
+  "server": [
+    "ItemPickupMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

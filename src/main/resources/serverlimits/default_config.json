@@ -1,0 +1,24 @@
+{
+  "explosion_limits": {
+    "enabled": true,
+    "sources": {
+      "tnt":         { "enabled": true,  "max_power": 4.0 },
+      "tnt_minecart":{ "enabled": true,  "max_power": 4.0 },
+      "bed":         { "enabled": true,  "max_power": 5.0 },
+      "end_crystal": { "enabled": true,  "max_power": 4.0 },
+      "creeper":     { "enabled": false, "max_power": 3.0 },
+      "ghast":       { "enabled": false, "max_power": 1.0 }
+    }
+  },
+  "item_limits": {
+    "enabled": true,
+    "check_interval_ticks": 20,
+    "items": {
+      "minecraft:totem_of_undying": 1,
+      "minecraft:cobweb": 16,
+      "minecraft:obsidian": 64,
+      "minecraft:golden_apple": 8,
+      "minecraft:enchanted_golden_apple": 1
+    }
+  }
+}
