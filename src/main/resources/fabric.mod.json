@@ -1,16 +1,25 @@
 {
   "schemaVersion": 1,
-  "id": "serverlimits",
+  "id": "warden",
   "version": "${version}",
-  "name": "ServerLimits",
-  "description": "Configurable explosion power limits and per-player item caps.",
-  "authors": [],
+  "name": "Warden",
+  "description": "Configurable limits for explosions, items, weapons, enchantments, and effects.",
+  "authors": [
+    "YourNameHere"
+  ],
+  "contact": {
+    "homepage": "https://modrinth.com/mod/warden",
+    "sources": "https://github.com/YourUser/warden",
+    "issues": "https://github.com/YourUser/warden/issues"
+  },
   "license": "MIT",
+  "icon": "assets/warden/icon.png",
   "environment": "*",
   "entrypoints": {
-    "main": ["com.serverlimits.ServerLimitsMod"]
+    "main": ["com.warden.WardenMod"],
+    "client": ["com.warden.WardenClient"]
   },
-  "mixins": ["serverlimits.mixins.json"],
+  "mixins": ["warden.mixins.json"],
   "depends": {
     "fabricloader": ">=0.16.0",
     "fabric-api": "*",
