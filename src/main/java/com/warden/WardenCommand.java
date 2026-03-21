@@ -1,0 +1,2181 @@
+package com.warden;
+
+import com.mojang.brigadier.arguments.BoolArgumentType;
+import com.mojang.brigadier.arguments.FloatArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.exceptions.DynamicCommandExceptionType;
+import com.mojang.brigadier.exceptions.SimpleCommandExceptionType;
+import com.warden.config.WardenConfig;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.minecraft.command.CommandSource;
+import net.minecraft.command.argument.IdentifierArgumentType;
+import net.minecraft.command.permission.Permission;
+import net.minecraft.command.permission.PermissionLevel;
+import net.minecraft.item.Item;
+import net.minecraft.registry.Registries;
+import net.minecraft.registry.RegistryKeys;
+import net.minecraft.server.command.ServerCommandSource;
+import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.text.MutableText;
+import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
+import net.minecraft.util.Identifier;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static net.minecraft.server.command.CommandManager.argument;
+import static net.minecraft.server.command.CommandManager.literal;
+
+public class WardenCommand {
+
+    private static MutableText wardenPrefix() {
+        return Text.literal("[")
+                .append(Text.literal("WARDEN").formatted(Formatting.DARK_PURPLE, Formatting.BOLD))
+                .append(Text.literal("] "));
+    }
+
+    private static final SimpleCommandExceptionType INVALID_ACTION_BAR_CATEGORY =
+            new SimpleCommandExceptionType(wardenPrefix().append(Text.literal("Unknown action bar category").formatted(Formatting.RED)));
+    private static final DynamicCommandExceptionType INVALID_WEAPON_STAT_TARGET =
+            new DynamicCommandExceptionType(message -> wardenPrefix().append(Text.literal(message.toString()).formatted(Formatting.RED)));
+    private static final List<String> RESET_CATEGORIES = List.of(
+            "explosion", "item", "weapon", "enchant", "effect", "xp", "actionbar", "exempt"
+    );
+
+    private static final List<String> EXPLOSION_SOURCES = List.of(
+            "tnt", "tnt_minecart", "creeper", "bed", "respawn_anchor", "end_crystal", "ghast",
+            "wither", "wither_skull"
+    );
+
+    private static final Map<String, List<String>> WEAPON_TARGETS = createWeaponTargets();
+    private static final java.util.Set<String> ENCHANT_TARGET_SUGGESTIONS = createEnchantTargetSuggestions();
+    private static final java.util.Set<String> WEAPON_TARGET_SUGGESTIONS = createWeaponTargetSuggestions();
+    private static final List<String> ACTION_BAR_CATEGORIES = List.of("item", "weapon", "enchantment", "effect");
+
+    private static Map<String, List<String>> createWeaponTargets() {
+        Map<String, List<String>> targets = new LinkedHashMap<>();
+        targets.put("sword", WardenToolType.SWORD.items);
+        targets.put("axe", WardenToolType.AXE.items);
+        targets.put("mace", WardenToolType.MACE.items);
+        targets.put("spear", WardenToolType.SPEAR.items);
+        targets.put("bow", WardenToolType.BOW.items);
+        targets.put("crossbow", WardenToolType.CROSSBOW.items);
+        targets.put("trident", WardenToolType.TRIDENT.items);
+        List<String> all = new ArrayList<>();
+        for (List<String> items : targets.values()) {
+            all.addAll(items);
+        }
+        targets.put("weapon", List.copyOf(all));
+        return Map.copyOf(targets);
+    }
+
+    private static java.util.Set<String> createEnchantTargetSuggestions() {
+        java.util.Set<String> suggestions = new LinkedHashSet<>(WardenToolType.keys());
+        for (WardenToolType type : WardenToolType.values()) {
+            for (String id : type.items) {
+                suggestions.add(id.substring("minecraft:".length()));
+            }
+        }
+        return java.util.Collections.unmodifiableSet(suggestions);
+    }
+
+    private static java.util.Set<String> getConfiguredEnchantmentSuggestions() {
+        java.util.Set<String> suggestions = new LinkedHashSet<>(WardenMod.CONFIG.enchantmentLimits.keySet());
+        for (Map<String, Integer> overrides : WardenMod.CONFIG.itemEnchantmentOverrides.values()) {
+            suggestions.addAll(overrides.keySet());
+        }
+        return suggestions;
+    }
+
+    private static java.util.Set<String> createWeaponTargetSuggestions() {
+        java.util.Set<String> suggestions = new LinkedHashSet<>(WEAPON_TARGETS.keySet());
+        for (List<String> items : WEAPON_TARGETS.values()) {
+            for (String id : items) {
+                suggestions.add(id.substring("minecraft:".length()));
+            }
+        }
+        return java.util.Collections.unmodifiableSet(suggestions);
+    }
+
+    private static boolean isMeleeWeaponTarget(String itemId) {
+        WardenToolType type = WardenToolType.byItemId(itemId);
+        return type == WardenToolType.SWORD
+                || type == WardenToolType.AXE
+                || type == WardenToolType.MACE
+                || type == WardenToolType.SPEAR
+                || type == WardenToolType.TRIDENT;
+    }
+
+    private static boolean isRangedWeaponTarget(String itemId) {
+        WardenToolType type = WardenToolType.byItemId(itemId);
+        return type == WardenToolType.BOW
+                || type == WardenToolType.CROSSBOW
+                || type == WardenToolType.TRIDENT;
+    }
+
+    private static List<String> resolveTargetItems(String target) {
+        WardenToolType type = WardenToolType.byKey(target);
+        if (type != null) {
+            return type.items;
+        }
+        if (target.contains(":")) {
+            return List.of(target);
+        }
+        return List.of("minecraft:" + target);
+    }
+
+    private static List<String> resolveWeaponItems(String target) {
+        List<String> items = WEAPON_TARGETS.get(target);
+        if (items != null) {
+            return items;
+        }
+        if (target.contains(":")) {
+            return List.of(target);
+        }
+        return List.of("minecraft:" + target);
+    }
+
+    private static void syncWeaponRules(ServerCommandSource source) {
+        WardenNetworking.syncWeaponLimits(source.getServer());
+    }
+
+    private static boolean hasAdminPermission(ServerCommandSource src) {
+        return src.getPermissions().hasPermission(new Permission.Level(PermissionLevel.GAMEMASTERS));
+    }
+
+    public static void register() {
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+            dispatcher.register(buildRootCommand());
+        });
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildRootCommand() {
+        var root = literal("warden");
+        root.then(literal("reload").requires(WardenCommand::hasAdminPermission).executes(WardenCommand::reload));
+        root.then(buildResetCommand());
+        root.then(literal("status").executes(WardenCommand::status));
+        root.then(literal("help").executes(WardenCommand::help));
+        root.then(buildActionBarCommand());
+        root.then(buildExplosionCommand());
+        root.then(buildItemCommand());
+        root.then(buildWeaponCommand());
+        root.then(buildEnchantCommand());
+        root.then(buildEffectCommand());
+        root.then(buildXpCommand());
+        root.then(buildExemptCommand());
+        root.then(buildConfigCommand());
+        return root;
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildResetCommand() {
+        var reset = literal("reset").requires(WardenCommand::hasAdminPermission).executes(WardenCommand::resetAll);
+        reset.then(argument("category", StringArgumentType.word())
+                .suggests((ctx, builder) -> CommandSource.suggestMatching(RESET_CATEGORIES, builder))
+                .executes(WardenCommand::resetCategory));
+        return reset;
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildActionBarCommand() {
+        var actionBar = literal("actionbar")
+                .requires(src -> src.getEntity() instanceof net.minecraft.server.network.ServerPlayerEntity)
+                .then(literal("status").executes(WardenCommand::actionBarStatus));
+        var category = argument("category", StringArgumentType.word())
+                .suggests((ctx, builder) -> CommandSource.suggestMatching(ACTION_BAR_CATEGORIES, builder))
+                .executes(WardenCommand::actionBarCategoryStatus);
+        category.then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::actionBarSet));
+        actionBar.then(category);
+        return actionBar;
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildExplosionCommand() {
+        var explosion = literal("explosion").requires(WardenCommand::hasAdminPermission);
+        var status = literal("status").executes(WardenCommand::statusExplosionAll);
+        status.then(argument("source", StringArgumentType.word())
+                .suggests((ctx, builder) -> CommandSource.suggestMatching(EXPLOSION_SOURCES, builder))
+                .executes(WardenCommand::statusExplosion));
+        explosion.then(status);
+        explosion.then(literal("set")
+                .then(argument("source", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(EXPLOSION_SOURCES, builder))
+                        .then(literal("maxPower")
+                                .then(argument("value", FloatArgumentType.floatArg(0f)).executes(WardenCommand::explosionSet))
+                                .then(literal("default").executes(WardenCommand::explosionSetDefault)))));
+        explosion.then(literal("disable")
+                .then(argument("source", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(EXPLOSION_SOURCES, builder))
+                        .executes(WardenCommand::explosionDisable)));
+        explosion.then(literal("remove")
+                .then(argument("source", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(WardenMod.CONFIG.explosionSources.keySet(), builder))
+                        .executes(WardenCommand::explosionRemove)));
+        return explosion;
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildItemCommand() {
+        var item = literal("item").requires(WardenCommand::hasAdminPermission);
+        var status = literal("status").executes(WardenCommand::statusItemAll);
+        status.then(argument("item", IdentifierArgumentType.identifier())
+                .suggests((ctx, builder) -> CommandSource.suggestMatching(WardenMod.CONFIG.itemLimits.keySet(), builder))
+                .executes(WardenCommand::statusItem));
+        item.then(status);
+        item.then(literal("set")
+                .then(argument("item", IdentifierArgumentType.identifier())
+                        .suggests((ctx, builder) -> CommandSource.suggestIdentifiers(Registries.ITEM.getIds(), builder))
+                        .then(literal("maxCount")
+                                .then(argument("value", IntegerArgumentType.integer(0)).executes(WardenCommand::itemSet))
+                                .then(literal("default").executes(WardenCommand::itemSetDefault)))));
+        item.then(literal("disable")
+                .then(argument("item", IdentifierArgumentType.identifier())
+                        .suggests((ctx, builder) -> CommandSource.suggestIdentifiers(Registries.ITEM.getIds(), builder))
+                        .executes(WardenCommand::itemDisable)));
+        item.then(literal("remove")
+                .then(argument("item", IdentifierArgumentType.identifier())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(WardenMod.CONFIG.itemLimits.keySet(), builder))
+                        .executes(WardenCommand::itemRemove)));
+        return item;
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildWeaponCommand() {
+        var weapon = literal("weapon").requires(WardenCommand::hasAdminPermission);
+        var status = literal("status").executes(WardenCommand::statusWeaponAll);
+        status.then(argument("target", StringArgumentType.word())
+                .suggests((ctx, builder) -> CommandSource.suggestMatching(WEAPON_TARGET_SUGGESTIONS, builder))
+                .executes(WardenCommand::statusWeaponTarget));
+        weapon.then(status);
+
+        var target = argument("target", StringArgumentType.word())
+                .suggests((ctx, builder) -> CommandSource.suggestMatching(WEAPON_TARGET_SUGGESTIONS, builder));
+        var stat = argument("stat", StringArgumentType.word())
+                .suggests((ctx, builder) -> {
+                    String t = StringArgumentType.getString(ctx, "target");
+                    List<String> items = resolveWeaponItems(t);
+                    List<String> stats = new ArrayList<>();
+                    if (items.stream().anyMatch(WardenCommand::isMeleeWeaponTarget)) {
+                        stats.addAll(List.of("damage", "attackSpeed", "reach", "disableCooldown"));
+                    }
+                    if (items.stream().anyMatch(WardenCommand::isRangedWeaponTarget)) {
+                        stats.addAll(List.of("projectileDamage", "rechargeTime"));
+                    }
+                    if (stats.isEmpty()) {
+                        stats.addAll(List.of("damage", "attackSpeed", "reach", "disableCooldown", "projectileDamage", "rechargeTime"));
+                    }
+                    return CommandSource.suggestMatching(stats, builder);
+                });
+        stat.then(argument("value", FloatArgumentType.floatArg(0f)).executes(WardenCommand::weaponSetStat));
+        stat.then(literal("default").executes(WardenCommand::weaponSetStatDefault));
+        target.then(stat);
+        weapon.then(literal("set").then(target));
+
+        weapon.then(literal("disable")
+                .then(argument("target", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(WEAPON_TARGET_SUGGESTIONS, builder))
+                        .executes(WardenCommand::weaponDisable)));
+        weapon.then(literal("remove")
+                .then(argument("target", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(WEAPON_TARGET_SUGGESTIONS, builder))
+                        .executes(WardenCommand::weaponRemove)));
+        return weapon;
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildEnchantCommand() {
+        var enchant = literal("enchant").requires(WardenCommand::hasAdminPermission);
+
+        var status = literal("status").executes(WardenCommand::statusEnchantAll);
+        var enchantment = argument("enchantment", IdentifierArgumentType.identifier())
+                .suggests((ctx, builder) -> CommandSource.suggestMatching(getConfiguredEnchantmentSuggestions(), builder))
+                .executes(WardenCommand::statusEnchantDetail);
+        enchantment.then(literal("for")
+                .then(argument("target", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(ENCHANT_TARGET_SUGGESTIONS, builder))
+                        .executes(WardenCommand::statusEnchantForTarget)));
+        status.then(enchantment);
+        enchant.then(status);
+
+        var setEnchantment = argument("enchantment", IdentifierArgumentType.identifier())
+                .suggests(WardenCommand::suggestAllEnchantments);
+        var maxLevel = literal("maxLevel");
+        var setValue = argument("value", IntegerArgumentType.integer(-1)).executes(WardenCommand::enchantSet);
+        setValue.then(literal("for")
+                .then(argument("target", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(ENCHANT_TARGET_SUGGESTIONS, builder))
+                        .executes(WardenCommand::enchantToolSet)));
+        maxLevel.then(setValue);
+        var setDefault = literal("default").executes(WardenCommand::enchantSetDefault);
+        setDefault.then(literal("for")
+                .then(argument("target", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(ENCHANT_TARGET_SUGGESTIONS, builder))
+                        .executes(WardenCommand::enchantToolSetDefault)));
+        maxLevel.then(setDefault);
+        setEnchantment.then(maxLevel);
+        enchant.then(literal("set").then(setEnchantment));
+
+        var disableEnchantment = argument("enchantment", IdentifierArgumentType.identifier())
+                .suggests(WardenCommand::suggestAllEnchantments)
+                .executes(WardenCommand::enchantDisable);
+        disableEnchantment.then(literal("for")
+                .then(argument("target", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(ENCHANT_TARGET_SUGGESTIONS, builder))
+                        .executes(WardenCommand::enchantToolDisable)));
+        enchant.then(literal("disable").then(disableEnchantment));
+
+        var removeEnchantment = argument("enchantment", IdentifierArgumentType.identifier())
+                .suggests((ctx, builder) -> CommandSource.suggestMatching(getConfiguredEnchantmentSuggestions(), builder))
+                .executes(WardenCommand::enchantRemove);
+        removeEnchantment.then(literal("for")
+                .then(argument("target", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(ENCHANT_TARGET_SUGGESTIONS, builder))
+                        .executes(WardenCommand::enchantToolRemove)));
+        enchant.then(literal("remove").then(removeEnchantment));
+        return enchant;
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildEffectCommand() {
+        var effect = literal("effect").requires(WardenCommand::hasAdminPermission);
+        var status = literal("status").executes(WardenCommand::statusEffectAll);
+        status.then(argument("effect", IdentifierArgumentType.identifier())
+                .suggests(WardenCommand::suggestAllEffects)
+                .executes(WardenCommand::statusEffect));
+        effect.then(status);
+
+        var setEffect = argument("effect", IdentifierArgumentType.identifier())
+                .suggests(WardenCommand::suggestAllEffects);
+        setEffect.then(literal("maxLevel")
+                .then(argument("value", IntegerArgumentType.integer(0)).executes(WardenCommand::effectSetLevel))
+                .then(literal("default").executes(WardenCommand::effectSetLevelDefault)));
+        setEffect.then(literal("maxDuration")
+                .then(argument("value", IntegerArgumentType.integer(0)).executes(WardenCommand::effectSetDuration))
+                .then(literal("default").executes(WardenCommand::effectSetDurationDefault)));
+        effect.then(literal("set").then(setEffect));
+
+        effect.then(literal("disable")
+                .then(argument("effect", IdentifierArgumentType.identifier())
+                        .suggests(WardenCommand::suggestAllEffects)
+                        .executes(WardenCommand::effectDisable)));
+        effect.then(literal("remove")
+                .then(argument("effect", IdentifierArgumentType.identifier())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(WardenMod.CONFIG.effectLimits.keySet(), builder))
+                        .executes(WardenCommand::effectRemove)));
+        return effect;
+    }
+
+    private static final List<String> XP_SOURCES = List.of("villager_trading", "entitiesKilling", "blocksMining");
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildXpCommand() {
+        var xp = literal("xp").requires(WardenCommand::hasAdminPermission);
+        var status = literal("status").executes(WardenCommand::statusXpAll);
+        status.then(argument("source", StringArgumentType.word())
+                .suggests(WardenCommand::suggestXpSource)
+                .executes(WardenCommand::statusXp)
+                .then(literal("for")
+                        .then(argument("id", IdentifierArgumentType.identifier())
+                                .suggests(WardenCommand::suggestXpId)
+                                .executes(WardenCommand::statusXpFor))));
+        xp.then(status);
+        xp.then(literal("set")
+                .then(argument("source", StringArgumentType.word())
+                        .suggests(WardenCommand::suggestXpSource)
+                        .then(literal("maxGain")
+                                .then(argument("value", IntegerArgumentType.integer(-1))
+                                        .executes(WardenCommand::xpSet)
+                                        .then(literal("for")
+                                                .then(argument("id", IdentifierArgumentType.identifier())
+                                                        .suggests(WardenCommand::suggestXpId)
+                                                        .executes(WardenCommand::xpSetFor)))))
+                        .then(literal("default")
+                                .executes(WardenCommand::xpSetDefault)
+                                .then(literal("for")
+                                        .then(argument("id", IdentifierArgumentType.identifier())
+                                                .suggests(WardenCommand::suggestXpId)
+                                                .executes(WardenCommand::xpSetDefaultFor))))));
+        xp.then(literal("disable")
+                .then(argument("source", StringArgumentType.word())
+                        .suggests(WardenCommand::suggestXpSource)
+                        .executes(WardenCommand::xpDisable)
+                        .then(literal("for")
+                                .then(argument("id", IdentifierArgumentType.identifier())
+                                        .suggests(WardenCommand::suggestXpId)
+                                        .executes(WardenCommand::xpDisableFor)))));
+        xp.then(literal("remove")
+                .then(argument("source", StringArgumentType.word())
+                        .suggests(WardenCommand::suggestXpSource)
+                        .executes(WardenCommand::xpRemove)
+                        .then(literal("for")
+                                .then(argument("id", IdentifierArgumentType.identifier())
+                                        .suggests(WardenCommand::suggestXpId)
+                                        .executes(WardenCommand::xpRemoveFor)))));
+        return xp;
+    }
+
+    private static java.util.concurrent.CompletableFuture<com.mojang.brigadier.suggestion.Suggestions> suggestXpSource(
+            CommandContext<ServerCommandSource> ctx,
+            com.mojang.brigadier.suggestion.SuggestionsBuilder builder
+    ) {
+        return CommandSource.suggestMatching(XP_SOURCES, builder);
+    }
+
+    private static java.util.concurrent.CompletableFuture<com.mojang.brigadier.suggestion.Suggestions> suggestXpId(
+            CommandContext<ServerCommandSource> ctx,
+            com.mojang.brigadier.suggestion.SuggestionsBuilder builder
+    ) {
+        String source = StringArgumentType.getString(ctx, "source");
+        if ("entitiesKilling".equals(source)) {
+            return CommandSource.suggestIdentifiers(Registries.ENTITY_TYPE.getIds(), builder);
+        } else if ("blocksMining".equals(source)) {
+            return CommandSource.suggestIdentifiers(Registries.BLOCK.getIds(), builder);
+        }
+        return builder.buildFuture();
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildExemptCommand() {
+        var exempt = literal("exempt").requires(WardenCommand::hasAdminPermission);
+        exempt.then(literal("status").executes(WardenCommand::statusExempt));
+        exempt.then(literal("add")
+                .then(argument("player", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(
+                                ctx.getSource().getServer().getPlayerManager().getPlayerList()
+                                        .stream().map(p -> p.getName().getString()).toList(), builder))
+                        .executes(WardenCommand::exemptAdd)));
+        exempt.then(literal("remove")
+                .then(argument("player", StringArgumentType.word())
+                        .suggests((ctx, builder) -> CommandSource.suggestMatching(WardenMod.CONFIG.exemptPlayers, builder))
+                        .executes(WardenCommand::exemptRemove)));
+        return exempt;
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> buildConfigCommand() {
+        var config = literal("config").requires(WardenCommand::hasAdminPermission).executes(WardenCommand::configShowAll);
+        config.then(literal("itemLimitsEnabled")
+                .executes(ctx -> configShow(ctx, "itemLimitsEnabled", String.valueOf(WardenMod.CONFIG.itemLimitsEnabled)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configItemLimitsEnabled)));
+        config.then(literal("explosionLimitsEnabled")
+                .executes(ctx -> configShow(ctx, "explosionLimitsEnabled", String.valueOf(WardenMod.CONFIG.explosionLimitsEnabled)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configExplosionLimitsEnabled)));
+        config.then(literal("weaponLimitsEnabled")
+                .executes(ctx -> configShow(ctx, "weaponLimitsEnabled", String.valueOf(WardenMod.CONFIG.weaponLimitsEnabled)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configWeaponLimitsEnabled)));
+        config.then(literal("enchantmentLimitsEnabled")
+                .executes(ctx -> configShow(ctx, "enchantmentLimitsEnabled", String.valueOf(WardenMod.CONFIG.enchantmentLimitsEnabled)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configEnchantmentLimitsEnabled)));
+        config.then(literal("effectLimitsEnabled")
+                .executes(ctx -> configShow(ctx, "effectLimitsEnabled", String.valueOf(WardenMod.CONFIG.effectLimitsEnabled)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configEffectLimitsEnabled)));
+        config.then(literal("checkIntervalTicks")
+                .executes(ctx -> configShow(ctx, "checkIntervalTicks", String.valueOf(WardenMod.CONFIG.checkIntervalTicks)))
+                .then(argument("value", IntegerArgumentType.integer(1)).executes(WardenCommand::configCheckIntervalTicks)));
+        config.then(literal("dropPickupDelay")
+                .executes(ctx -> configShow(ctx, "dropPickupDelay", String.valueOf(WardenMod.CONFIG.dropPickupDelay)))
+                .then(argument("value", IntegerArgumentType.integer(0)).executes(WardenCommand::configDropPickupDelay)));
+        config.then(literal("deleteOverflowItem")
+                .executes(ctx -> configShow(ctx, "deleteOverflowItem", String.valueOf(WardenMod.CONFIG.deleteOverflowItem)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configDeleteOverflowItem)));
+        config.then(literal("itemActionBarEnabled")
+                .executes(ctx -> configShow(ctx, "itemActionBarEnabled", String.valueOf(WardenMod.CONFIG.itemActionBarEnabled)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configItemActionBarEnabled)));
+        config.then(literal("weaponActionBarEnabled")
+                .executes(ctx -> configShow(ctx, "weaponActionBarEnabled", String.valueOf(WardenMod.CONFIG.weaponActionBarEnabled)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configWeaponActionBarEnabled)));
+        config.then(literal("enchantmentActionBarEnabled")
+                .executes(ctx -> configShow(ctx, "enchantmentActionBarEnabled", String.valueOf(WardenMod.CONFIG.enchantmentActionBarEnabled)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configEnchantmentActionBarEnabled)));
+        config.then(literal("effectActionBarEnabled")
+                .executes(ctx -> configShow(ctx, "effectActionBarEnabled", String.valueOf(WardenMod.CONFIG.effectActionBarEnabled)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configEffectActionBarEnabled)));
+        config.then(literal("exemptCreative")
+                .executes(ctx -> configShow(ctx, "exemptCreative", String.valueOf(WardenMod.CONFIG.exemptCreative)))
+                .then(argument("value", BoolArgumentType.bool()).executes(WardenCommand::configExemptCreative)));
+        return config;
+    }
+
+    private static java.util.concurrent.CompletableFuture<com.mojang.brigadier.suggestion.Suggestions> suggestAllEnchantments(
+            CommandContext<ServerCommandSource> ctx,
+            com.mojang.brigadier.suggestion.SuggestionsBuilder builder
+    ) {
+        var reg = ctx.getSource().getServer().getRegistryManager().getOrThrow(RegistryKeys.ENCHANTMENT);
+        return CommandSource.suggestIdentifiers(reg.streamKeys().map(k -> k.getValue()), builder);
+    }
+
+    private static java.util.concurrent.CompletableFuture<com.mojang.brigadier.suggestion.Suggestions> suggestAllEffects(
+            CommandContext<ServerCommandSource> ctx,
+            com.mojang.brigadier.suggestion.SuggestionsBuilder builder
+    ) {
+        var reg = ctx.getSource().getServer().getRegistryManager().getOrThrow(RegistryKeys.STATUS_EFFECT);
+        return CommandSource.suggestIdentifiers(reg.streamKeys().map(k -> k.getValue()), builder);
+    }
+
+    private static int actionBarStatus(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        var player = ctx.getSource().getPlayerOrThrow();
+        String playerName = player.getName().getString();
+        MutableText response = wardenPrefix().append(Text.literal("Action bar notice preferences:").formatted(Formatting.GOLD));
+        for (String category : ACTION_BAR_CATEGORIES) {
+            boolean enabled = isActionBarEnabledForPlayer(playerName, category);
+            response.append(Text.literal("\n  ").formatted(Formatting.GRAY))
+                    .append(Text.literal(category).formatted(Formatting.YELLOW))
+                    .append(Text.literal(" = ").formatted(Formatting.GRAY))
+                    .append(Text.literal(enabled ? "ENABLED" : "DISABLED").formatted(enabled ? Formatting.GREEN : Formatting.RED));
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int actionBarCategoryStatus(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        var player = ctx.getSource().getPlayerOrThrow();
+        String category = getActionBarCategory(ctx);
+        boolean enabled = isActionBarEnabledForPlayer(player.getName().getString(), category);
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("actionbar.").formatted(Formatting.GRAY))
+                .append(Text.literal(category).formatted(Formatting.YELLOW))
+                .append(Text.literal(" = ").formatted(Formatting.GRAY))
+                .append(Text.literal(enabled ? "ENABLED" : "DISABLED").formatted(enabled ? Formatting.GREEN : Formatting.RED)), false);
+        return 1;
+    }
+
+    private static int actionBarSet(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        var player = ctx.getSource().getPlayerOrThrow();
+        String playerName = player.getName().getString();
+        String category = getActionBarCategory(ctx);
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        Set<String> disabled = WardenMod.CONFIG.playerActionBarDisabled.computeIfAbsent(playerName, k -> new LinkedHashSet<>());
+        if (value) {
+            disabled.remove(category);
+            if (disabled.isEmpty()) {
+                WardenMod.CONFIG.playerActionBarDisabled.remove(playerName);
+            }
+        } else {
+            disabled.add(category);
+        }
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("actionbar.").formatted(Formatting.GRAY))
+                .append(Text.literal(category).formatted(Formatting.YELLOW))
+                .append(Text.literal(" = ").formatted(Formatting.GRAY))
+                .append(Text.literal(value ? "ENABLED" : "DISABLED").formatted(value ? Formatting.GREEN : Formatting.RED))
+                .append(Text.literal(" for ").formatted(Formatting.GRAY))
+                .append(Text.literal(playerName).formatted(Formatting.AQUA)), false);
+        return 1;
+    }
+
+    private static String getActionBarCategory(CommandContext<ServerCommandSource> ctx)
+            throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        String category = StringArgumentType.getString(ctx, "category");
+        if (!ACTION_BAR_CATEGORIES.contains(category)) {
+            throw INVALID_ACTION_BAR_CATEGORY.create();
+        }
+        return category;
+    }
+
+    private static boolean isActionBarEnabledForPlayer(String playerName, String category) {
+        Set<String> disabled = WardenMod.CONFIG.playerActionBarDisabled.get(playerName);
+        return disabled == null || !disabled.contains(category);
+    }
+
+    private static int status(CommandContext<ServerCommandSource> ctx) {
+        WardenConfig cfg = WardenMod.CONFIG;
+        MutableText response = wardenPrefix().append(Text.literal("Status:").formatted(Formatting.GOLD));
+        response.append(Text.literal("\n  explosion limits: ").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.explosionLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.explosionLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  item limits: ").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.itemLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.itemLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  weapon limits: ").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.weaponLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.weaponLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  enchantment limits: ").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.enchantmentLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.enchantmentLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  effect limits: ").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.effectLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.effectLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int statusExplosionAll(CommandContext<ServerCommandSource> ctx) {
+        WardenConfig cfg = WardenMod.CONFIG;
+        MutableText response = wardenPrefix().append(Text.literal("Explosion limits (").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.explosionLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.explosionLimitsEnabled ? Formatting.GREEN : Formatting.RED))
+                .append(Text.literal("):").formatted(Formatting.GRAY));
+
+        if (cfg.explosionSources.isEmpty()) {
+            response.append(Text.literal("\n  (none configured)").formatted(Formatting.DARK_GRAY));
+        } else {
+            for (var e : cfg.explosionSources.entrySet()) {
+                response.append(Text.literal("\n  ").formatted(Formatting.GRAY))
+                        .append(Text.literal(e.getKey()).formatted(Formatting.YELLOW))
+                        .append(Text.literal(": enabled=").formatted(Formatting.GRAY))
+                        .append(Text.literal(String.valueOf(e.getValue().enabled)).formatted(e.getValue().enabled ? Formatting.GREEN : Formatting.RED))
+                        .append(Text.literal(", maxPower=").formatted(Formatting.GRAY))
+                        .append(Text.literal(String.valueOf(e.getValue().maxPower)).formatted(Formatting.AQUA));
+            }
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int statusExplosion(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        WardenConfig.ExplosionSourceConfig cfg = WardenMod.CONFIG.explosionSources.get(source);
+        if (cfg == null) {
+            ctx.getSource().sendFeedback(() -> wardenPrefix()
+                    .append(Text.literal("explosion.").formatted(Formatting.GRAY))
+                    .append(Text.literal(source).formatted(Formatting.YELLOW))
+                    .append(Text.literal(": not configured").formatted(Formatting.RED)), false);
+        } else {
+            ctx.getSource().sendFeedback(() -> wardenPrefix()
+                    .append(Text.literal("explosion.").formatted(Formatting.GRAY))
+                    .append(Text.literal(source).formatted(Formatting.YELLOW))
+                    .append(Text.literal(": enabled=").formatted(Formatting.GRAY))
+                    .append(Text.literal(String.valueOf(cfg.enabled)).formatted(cfg.enabled ? Formatting.GREEN : Formatting.RED))
+                    .append(Text.literal(", maxPower=").formatted(Formatting.GRAY))
+                    .append(Text.literal(String.valueOf(cfg.maxPower)).formatted(Formatting.AQUA)), false);
+        }
+        return 1;
+    }
+
+    private static int statusItemAll(CommandContext<ServerCommandSource> ctx) {
+        WardenConfig cfg = WardenMod.CONFIG;
+        MutableText response = wardenPrefix().append(Text.literal("Item limits (").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.itemLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.itemLimitsEnabled ? Formatting.GREEN : Formatting.RED))
+                .append(Text.literal("):").formatted(Formatting.GRAY));
+
+        if (cfg.itemLimits.isEmpty()) {
+            response.append(Text.literal("\n  (none configured)").formatted(Formatting.DARK_GRAY));
+        } else {
+            for (var e : cfg.itemLimits.entrySet()) {
+                response.append(Text.literal("\n  ").formatted(Formatting.GRAY))
+                        .append(Text.literal(e.getKey()).formatted(Formatting.YELLOW))
+                        .append(Text.literal(": maxCount=").formatted(Formatting.GRAY))
+                        .append(Text.literal(String.valueOf(e.getValue())).formatted(Formatting.AQUA));
+            }
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int statusItem(CommandContext<ServerCommandSource> ctx) {
+        String item = IdentifierArgumentType.getIdentifier(ctx, "item").toString();
+        Integer limit = WardenMod.CONFIG.itemLimits.get(item);
+        if (limit == null) {
+            ctx.getSource().sendFeedback(() -> wardenPrefix()
+                    .append(Text.literal("item.").formatted(Formatting.GRAY))
+                    .append(Text.literal(item).formatted(Formatting.YELLOW))
+                    .append(Text.literal(": not configured").formatted(Formatting.RED)), false);
+        } else {
+            ctx.getSource().sendFeedback(() -> wardenPrefix()
+                    .append(Text.literal("item.").formatted(Formatting.GRAY))
+                    .append(Text.literal(item).formatted(Formatting.YELLOW))
+                    .append(Text.literal(": maxCount=").formatted(Formatting.GRAY))
+                    .append(Text.literal(String.valueOf(limit)).formatted(Formatting.AQUA)), false);
+        }
+        return 1;
+    }
+
+    private static int statusWeaponAll(CommandContext<ServerCommandSource> ctx) {
+        WardenConfig cfg = WardenMod.CONFIG;
+        MutableText response = wardenPrefix().append(Text.literal("Weapon limits (").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.weaponLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.weaponLimitsEnabled ? Formatting.GREEN : Formatting.RED))
+                .append(Text.literal("):").formatted(Formatting.GRAY));
+
+        if (cfg.weaponLimits.isEmpty()) {
+            response.append(Text.literal("\n  (none configured)").formatted(Formatting.DARK_GRAY));
+        } else {
+            for (var e : cfg.weaponLimits.entrySet()) {
+                response.append(Text.literal("\n  ").formatted(Formatting.GRAY))
+                        .append(Text.literal(e.getKey()).formatted(Formatting.YELLOW))
+                        .append(Text.literal(": ").formatted(Formatting.GRAY))
+                        .append(Text.literal(formatWeaponConfig(e.getValue())).formatted(Formatting.AQUA));
+            }
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int statusWeaponTarget(CommandContext<ServerCommandSource> ctx) {
+        String target = StringArgumentType.getString(ctx, "target");
+        List<String> items = resolveWeaponItems(target);
+        MutableText response = wardenPrefix().append(Text.literal("Weapon limits for ").formatted(Formatting.GRAY))
+                .append(Text.literal(target).formatted(Formatting.YELLOW))
+                .append(Text.literal(":").formatted(Formatting.GRAY));
+
+        for (String itemId : items) {
+            WardenConfig.WeaponLimitConfig cfg = WardenMod.CONFIG.weaponLimits.get(itemId);
+            response.append(Text.literal("\n  ").formatted(Formatting.GRAY))
+                    .append(Text.literal(itemId).formatted(Formatting.YELLOW))
+                    .append(Text.literal(": ").formatted(Formatting.GRAY))
+                    .append(Text.literal(cfg == null ? "not configured" : formatWeaponConfig(cfg)).formatted(cfg == null ? Formatting.RED : Formatting.AQUA));
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int statusEnchantAll(CommandContext<ServerCommandSource> ctx) {
+        WardenConfig cfg = WardenMod.CONFIG;
+        MutableText response = wardenPrefix().append(Text.literal("Enchantment limits (").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.enchantmentLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.enchantmentLimitsEnabled ? Formatting.GREEN : Formatting.RED))
+                .append(Text.literal("):").formatted(Formatting.GRAY));
+
+        if (cfg.enchantmentLimits.isEmpty()) {
+            response.append(Text.literal("\n  (none)").formatted(Formatting.DARK_GRAY));
+        } else {
+            for (var e : cfg.enchantmentLimits.entrySet()) {
+                response.append(Text.literal("\n  ").formatted(Formatting.GRAY))
+                        .append(Text.literal(e.getKey()).formatted(Formatting.YELLOW))
+                        .append(Text.literal(": maxLevel=").formatted(Formatting.GRAY))
+                        .append(Text.literal(e.getValue() == -1 ? "unlimited" : String.valueOf(e.getValue())).formatted(e.getValue() == -1 ? Formatting.GREEN : Formatting.AQUA));
+            }
+        }
+        if (!cfg.itemEnchantmentOverrides.isEmpty()) {
+            response.append(Text.literal("\n  item overrides: ").formatted(Formatting.GRAY))
+                    .append(Text.literal(String.join(", ", cfg.itemEnchantmentOverrides.keySet())).formatted(Formatting.YELLOW));
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int statusEnchantDetail(CommandContext<ServerCommandSource> ctx) {
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        WardenConfig cfg = WardenMod.CONFIG;
+        MutableText response = wardenPrefix().append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(":").formatted(Formatting.GRAY));
+
+        Integer global = cfg.enchantmentLimits.get(enchId);
+        response.append(Text.literal("\n  global: ").formatted(Formatting.GRAY))
+                .append(global != null ? Text.literal("maxLevel=" + (global == -1 ? "unlimited" : global)).formatted(global == -1 ? Formatting.GREEN : Formatting.AQUA) : Text.literal("not configured").formatted(Formatting.RED));
+
+        for (var itemEntry : cfg.itemEnchantmentOverrides.entrySet()) {
+            Integer override = itemEntry.getValue().get(enchId);
+            if (override != null) {
+                response.append(Text.literal("\n  ").formatted(Formatting.GRAY))
+                        .append(Text.literal(itemEntry.getKey()).formatted(Formatting.YELLOW))
+                        .append(Text.literal(": maxLevel=").formatted(Formatting.GRAY))
+                        .append(Text.literal(override == -1 ? "unlimited" : String.valueOf(override)).formatted(override == -1 ? Formatting.GREEN : Formatting.AQUA));
+            }
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int statusEnchantForTarget(CommandContext<ServerCommandSource> ctx) {
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        String target = StringArgumentType.getString(ctx, "target");
+        List<String> items = resolveTargetItems(target);
+        WardenConfig cfg = WardenMod.CONFIG;
+        Integer global = cfg.enchantmentLimits.get(enchId);
+        MutableText response = wardenPrefix().append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" for ").formatted(Formatting.GRAY))
+                .append(Text.literal(target).formatted(Formatting.YELLOW))
+                .append(Text.literal(":").formatted(Formatting.GRAY));
+
+        for (String itemId : items) {
+            Map<String, Integer> overrides = cfg.itemEnchantmentOverrides.get(itemId);
+            Integer override = overrides != null ? overrides.get(enchId) : null;
+            response.append(Text.literal("\n  ").formatted(Formatting.GRAY))
+                    .append(Text.literal(itemId).formatted(Formatting.YELLOW))
+                    .append(Text.literal(": ").formatted(Formatting.GRAY));
+            if (override != null) {
+                response.append(Text.literal("maxLevel=" + (override == -1 ? "unlimited" : override)).formatted(override == -1 ? Formatting.GREEN : Formatting.AQUA))
+                        .append(Text.literal(" (override)").formatted(Formatting.ITALIC, Formatting.DARK_GRAY));
+            } else if (global != null) {
+                response.append(Text.literal("maxLevel=" + (global == -1 ? "unlimited" : global)).formatted(global == -1 ? Formatting.GREEN : Formatting.AQUA))
+                        .append(Text.literal(" (global)").formatted(Formatting.ITALIC, Formatting.DARK_GRAY));
+            } else {
+                response.append(Text.literal("not configured").formatted(Formatting.RED));
+            }
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int reload(CommandContext<ServerCommandSource> ctx) {
+        WardenMod.CONFIG = WardenConfig.load();
+        syncWeaponRules(ctx.getSource());
+        ctx.getSource().sendFeedback(() -> wardenPrefix().append(Text.literal("Config reloaded from disk.").formatted(Formatting.GREEN)), true);
+        return 1;
+    }
+
+    private static int resetAll(CommandContext<ServerCommandSource> ctx) {
+        WardenMod.CONFIG.resetAll();
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        ctx.getSource().sendFeedback(() -> wardenPrefix().append(Text.literal("Config reset to defaults (all categories wiped)").formatted(Formatting.GREEN)), true);
+        return 1;
+    }
+
+    private static int resetCategory(CommandContext<ServerCommandSource> ctx) {
+        String category = StringArgumentType.getString(ctx, "category");
+        if (!WardenMod.CONFIG.resetCategory(category)) {
+            ctx.getSource().sendError(wardenPrefix().append(Text.literal("Unknown reset category: " + category).formatted(Formatting.RED)));
+            return 0;
+        }
+        WardenMod.CONFIG.save();
+        if ("weapon".equals(category)) {
+            syncWeaponRules(ctx.getSource());
+        }
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("Config reset to defaults for category: ").formatted(Formatting.GREEN))
+                .append(Text.literal(category).formatted(Formatting.YELLOW)), true);
+        return 1;
+    }
+
+    private static int explosionSet(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        float value = FloatArgumentType.getFloat(ctx, "value");
+        WardenConfig.ExplosionSourceConfig src = WardenMod.CONFIG.explosionSources.computeIfAbsent(
+                source, k -> new WardenConfig.ExplosionSourceConfig(true, value));
+        src.maxPower = value;
+        src.enabled = true;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("explosion.").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxPower = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int explosionSetDefault(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        WardenMod.CONFIG.explosionSources.remove(source);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("explosion.").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.YELLOW))
+                .append(Text.literal(" reset to default (no cap)").formatted(Formatting.GREEN)), true);
+        return 1;
+    }
+
+    private static int explosionDisable(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        WardenConfig.ExplosionSourceConfig src = WardenMod.CONFIG.explosionSources.computeIfAbsent(
+                source, k -> new WardenConfig.ExplosionSourceConfig(true, 0f));
+        src.maxPower = 0f;
+        src.enabled = true;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("explosion.").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxPower = 0 (cancelled)").formatted(Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int explosionRemove(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        boolean had = WardenMod.CONFIG.explosionSources.remove(source) != null;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("explosion.").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.YELLOW))
+                .append(Text.literal(had ? " cap disabled (default behavior: no cap)" : " already at default behavior (no cap)").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int itemSet(CommandContext<ServerCommandSource> ctx) {
+        String item = IdentifierArgumentType.getIdentifier(ctx, "item").toString();
+        int value = IntegerArgumentType.getInteger(ctx, "value");
+        WardenMod.CONFIG.itemLimits.put(item, value);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("item.").formatted(Formatting.GRAY))
+                .append(Text.literal(item).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxCount = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int itemSetDefault(CommandContext<ServerCommandSource> ctx) {
+        String itemId = IdentifierArgumentType.getIdentifier(ctx, "item").toString();
+        WardenMod.CONFIG.itemLimits.remove(itemId);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("item.").formatted(Formatting.GRAY))
+                .append(Text.literal(itemId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" reset to default (no limit)").formatted(Formatting.GREEN)), true);
+        return 1;
+    }
+
+    private static int itemDisable(CommandContext<ServerCommandSource> ctx) {
+        String item = IdentifierArgumentType.getIdentifier(ctx, "item").toString();
+        WardenMod.CONFIG.itemLimits.put(item, 0);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("item.").formatted(Formatting.GRAY))
+                .append(Text.literal(item).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxCount = 0 (blocked)").formatted(Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int itemRemove(CommandContext<ServerCommandSource> ctx) {
+        String itemId = IdentifierArgumentType.getIdentifier(ctx, "item").toString();
+        boolean had = WardenMod.CONFIG.itemLimits.remove(itemId) != null;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("item.").formatted(Formatting.GRAY))
+                .append(Text.literal(itemId).formatted(Formatting.YELLOW))
+                .append(Text.literal(had ? " cap disabled (default: no cap)" : " already at default behavior (no cap)").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int weaponSetStat(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        String stat = StringArgumentType.getString(ctx, "stat");
+        float value = FloatArgumentType.getFloat(ctx, "value");
+        return switch (stat) {
+            case "damage" -> applyWeaponLimit(ctx, "attackDamage", value);
+            case "attackSpeed" -> applyWeaponLimit(ctx, "attackSpeed", value);
+            case "reach" -> applyWeaponLimit(ctx, "reach", value);
+            case "disableCooldown" -> applyWeaponCooldownLimit(ctx, Math.round(value));
+            case "projectileDamage" -> applyWeaponProjectileDamage(ctx, value);
+            case "rechargeTime" -> applyWeaponRechargeTime(ctx, Math.round(value));
+            default -> {
+                ctx.getSource().sendFeedback(() -> wardenPrefix()
+                        .append(Text.literal("Unknown weapon stat: ").formatted(Formatting.RED))
+                        .append(Text.literal(stat).formatted(Formatting.YELLOW)), false);
+                yield 0;
+            }
+        };
+    }
+
+    private static int weaponSetStatDefault(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        String stat = StringArgumentType.getString(ctx, "stat");
+        String internalStat = switch (stat) {
+            case "damage" -> "attackDamage";
+            case "attackSpeed" -> "attackSpeed";
+            case "reach" -> "reach";
+            case "disableCooldown" -> "disableCooldown";
+            case "projectileDamage" -> "projectileDamage";
+            case "rechargeTime" -> "rechargeTime";
+            default -> stat;
+        };
+        return applyWeaponDefault(ctx, internalStat);
+    }
+
+    private static int weaponSetDamage(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponLimit(ctx, "attackDamage", FloatArgumentType.getFloat(ctx, "value"));
+    }
+
+    private static int weaponSetDamageDefault(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponDefault(ctx, "attackDamage");
+    }
+
+    private static int weaponSetAttackSpeed(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponLimit(ctx, "attackSpeed", FloatArgumentType.getFloat(ctx, "value"));
+    }
+
+    private static int weaponSetAttackSpeedDefault(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponDefault(ctx, "attackSpeed");
+    }
+
+    private static int weaponSetReach(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponLimit(ctx, "reach", FloatArgumentType.getFloat(ctx, "value"));
+    }
+
+    private static int weaponSetReachDefault(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponDefault(ctx, "reach");
+    }
+
+    private static int weaponSetDisableCooldown(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponCooldownLimit(ctx, IntegerArgumentType.getInteger(ctx, "value"));
+    }
+
+    private static int weaponSetDisableCooldownDefault(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponDefault(ctx, "disableCooldown");
+    }
+
+    private static int weaponSetProjectileDamage(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponProjectileDamage(ctx, FloatArgumentType.getFloat(ctx, "value"));
+    }
+
+    private static int weaponSetProjectileDamageDefault(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponDefault(ctx, "projectileDamage");
+    }
+
+    private static int weaponSetRechargeTime(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponRechargeTime(ctx, IntegerArgumentType.getInteger(ctx, "value"));
+    }
+
+    private static int weaponSetRechargeTimeDefault(CommandContext<ServerCommandSource> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        return applyWeaponDefault(ctx, "rechargeTime");
+    }
+
+    private static int applyWeaponLimit(CommandContext<ServerCommandSource> ctx, String stat, float value)
+            throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        String target = StringArgumentType.getString(ctx, "target");
+        List<String> items = resolveWeaponItems(target);
+        validateWeaponStatTarget(stat, target, items);
+        int applied = 0;
+        int defaulted = 0;
+        for (String itemId : items) {
+            Item item = getItem(itemId);
+            Double vanillaDouble = item == null ? null : getVanillaWeaponDouble(item, stat);
+            Float vanillaFloat = item == null ? null : getVanillaWeaponFloat(item, stat);
+            WardenConfig.WeaponLimitConfig cfg = WardenMod.CONFIG.weaponLimits.computeIfAbsent(
+                    itemId, k -> new WardenConfig.WeaponLimitConfig()
+            );
+
+            if (("attackDamage".equals(stat) || "attackSpeed".equals(stat))
+                    && vanillaDouble != null
+                    && approximatelyEquals(vanillaDouble, value)) {
+                if (clearWeaponStat(cfg, stat)) {
+                    defaulted++;
+                }
+            } else if ("reach".equals(stat)
+                    && vanillaFloat != null
+                    && approximatelyEquals(vanillaFloat, value)) {
+                if (clearWeaponStat(cfg, stat)) {
+                    defaulted++;
+                }
+            } else {
+                setWeaponStat(cfg, stat, value);
+                applied++;
+            }
+
+            if (!cfg.isConfigured()) {
+                WardenMod.CONFIG.weaponLimits.remove(itemId);
+            }
+        }
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        MutableText responseText = wardenPrefix()
+                .append(Text.literal("weapon.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(".").formatted(Formatting.GRAY))
+                .append(Text.literal(stat).formatted(Formatting.YELLOW))
+                .append(Text.literal(" = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(Formatting.AQUA));
+
+        if (applied > 0 && defaulted > 0) {
+            responseText.append(Text.literal(" (" + applied + " applied, " + defaulted + " using default behavior: vanilla values)").formatted(Formatting.ITALIC, Formatting.DARK_GRAY));
+        } else if (applied == 0 && defaulted > 0) {
+            responseText = wardenPrefix()
+                    .append(Text.literal("weapon.").formatted(Formatting.GRAY))
+                    .append(Text.literal(label).formatted(Formatting.YELLOW))
+                    .append(Text.literal(".").formatted(Formatting.GRAY))
+                    .append(Text.literal(stat).formatted(Formatting.YELLOW))
+                    .append(Text.literal(" cap disabled (default behavior: vanilla values)").formatted(Formatting.GRAY));
+        }
+
+        final MutableText finalResponse = responseText;
+        ctx.getSource().sendFeedback(() -> finalResponse, true);
+        return 1;
+    }
+
+    private static int applyWeaponCooldownLimit(CommandContext<ServerCommandSource> ctx, int value)
+            throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        String target = StringArgumentType.getString(ctx, "target");
+        List<String> items = resolveWeaponItems(target);
+        validateWeaponStatTarget("disableCooldown", target, items);
+        for (String itemId : items) {
+            WardenConfig.WeaponLimitConfig cfg = WardenMod.CONFIG.weaponLimits.computeIfAbsent(
+                    itemId, k -> new WardenConfig.WeaponLimitConfig()
+            );
+            cfg.disableCooldownTicks = value;
+            if (!cfg.isConfigured()) {
+                WardenMod.CONFIG.weaponLimits.remove(itemId);
+            }
+        }
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        // Clear any stuck cooldowns on online players caused by the old config value
+        for (String itemId : items) {
+            Item item = Registries.ITEM.get(Identifier.of(itemId));
+            if (item != null) {
+                for (ServerPlayerEntity player : ctx.getSource().getServer().getPlayerManager().getPlayerList()) {
+                    player.getItemCooldownManager().remove(Registries.ITEM.getId(item));
+                }
+            }
+        }
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("weapon.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(".disableCooldown = ").formatted(Formatting.GRAY))
+                .append(Text.literal(value + " ticks").formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int applyWeaponProjectileDamage(CommandContext<ServerCommandSource> ctx, float value)
+            throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        String target = StringArgumentType.getString(ctx, "target");
+        List<String> items = resolveWeaponItems(target);
+        validateWeaponStatTarget("projectileDamage", target, items);
+        for (String itemId : items) {
+            WardenConfig.WeaponLimitConfig cfg = WardenMod.CONFIG.weaponLimits.computeIfAbsent(
+                    itemId, k -> new WardenConfig.WeaponLimitConfig()
+            );
+            cfg.projectileDamage = (double) value;
+        }
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("weapon.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(".projectileDamage = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int applyWeaponRechargeTime(CommandContext<ServerCommandSource> ctx, int value)
+            throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        String target = StringArgumentType.getString(ctx, "target");
+        List<String> items = resolveWeaponItems(target);
+        validateWeaponStatTarget("rechargeTime", target, items);
+        for (String itemId : items) {
+            WardenConfig.WeaponLimitConfig cfg = WardenMod.CONFIG.weaponLimits.computeIfAbsent(
+                    itemId, k -> new WardenConfig.WeaponLimitConfig()
+            );
+            cfg.rechargeTicks = value;
+            if (!cfg.isConfigured()) {
+                WardenMod.CONFIG.weaponLimits.remove(itemId);
+            }
+        }
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("weapon.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(".rechargeTime = ").formatted(Formatting.GRAY))
+                .append(Text.literal(value + " ticks").formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int applyWeaponDefault(CommandContext<ServerCommandSource> ctx, String stat)
+            throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        String target = StringArgumentType.getString(ctx, "target");
+        List<String> items = resolveWeaponItems(target);
+        validateWeaponStatTarget(stat, target, items);
+        int reset = 0;
+        for (String itemId : items) {
+            WardenConfig.WeaponLimitConfig cfg = WardenMod.CONFIG.weaponLimits.get(itemId);
+            if (cfg == null) {
+                continue;
+            }
+            boolean changed = false;
+            if ("attackDamage".equals(stat) && cfg.attackDamage != null) {
+                cfg.attackDamage = null;
+                changed = true;
+            } else if ("attackSpeed".equals(stat) && cfg.attackSpeed != null) {
+                cfg.attackSpeed = null;
+                changed = true;
+            } else if ("reach".equals(stat) && cfg.reach != null) {
+                cfg.reach = null;
+                changed = true;
+            } else if ("disableCooldown".equals(stat) && cfg.disableCooldownTicks != null) {
+                cfg.disableCooldownTicks = null;
+                changed = true;
+                // Clear stuck cooldowns on online players since the limit was removed
+                Item item = Registries.ITEM.get(Identifier.of(itemId));
+                if (item != null) {
+                    for (ServerPlayerEntity player : ctx.getSource().getServer().getPlayerManager().getPlayerList()) {
+                        player.getItemCooldownManager().remove(Registries.ITEM.getId(item));
+                    }
+                }
+            } else if ("projectileDamage".equals(stat) && cfg.projectileDamage != null) {
+                cfg.projectileDamage = null;
+                changed = true;
+            } else if ("rechargeTime".equals(stat) && cfg.rechargeTicks != null) {
+                cfg.rechargeTicks = null;
+                changed = true;
+            }
+            if (changed) {
+                reset++;
+                if (!cfg.isConfigured()) {
+                    WardenMod.CONFIG.weaponLimits.remove(itemId);
+                }
+            }
+        }
+        WardenMod.CONFIG.save();
+        int resetCount = reset;
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+
+        String vanillaValue = "vanilla values";
+        if (items.size() == 1) {
+            Item item = getItem(items.get(0));
+            if (item != null) {
+                Double dv = getVanillaWeaponDouble(item, stat);
+                Float fv = getVanillaWeaponFloat(item, stat);
+                if (dv != null) vanillaValue = "vanilla value: " + dv;
+                else if (fv != null) vanillaValue = "vanilla value: " + fv;
+                else if ("disableCooldown".equals(stat)) vanillaValue = "default behavior: no extra cooldown";
+                else if ("projectileDamage".equals(stat)) vanillaValue = "default behavior: vanilla projectile logic";
+                else if ("rechargeTime".equals(stat)) {
+                    int recharge = items.get(0).contains("bow") ? 20 : (items.get(0).contains("trident") ? 10 : 0);
+                    vanillaValue = recharge > 0 ? "vanilla value: " + recharge + " ticks" : "default behavior: no recharge";
+                }
+            }
+        }
+
+        final String finalVanilla = vanillaValue;
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("weapon.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(".").formatted(Formatting.GRAY))
+                .append(Text.literal(stat).formatted(Formatting.YELLOW))
+                .append(Text.literal(resetCount > 0 ? " cap disabled (default behavior: " + finalVanilla + ")" : " already at default behavior (" + finalVanilla + ")").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int weaponDisable(CommandContext<ServerCommandSource> ctx) {
+        String target = StringArgumentType.getString(ctx, "target");
+        List<String> items = resolveWeaponItems(target);
+        for (String itemId : items) {
+            WardenConfig.WeaponLimitConfig cfg = WardenMod.CONFIG.weaponLimits.computeIfAbsent(itemId, k -> new WardenConfig.WeaponLimitConfig());
+            cfg.attackDamage = 0.0;
+            cfg.attackSpeed = 0.0;
+            cfg.reach = 0.0f;
+            cfg.disableCooldownTicks = 0;
+            cfg.projectileDamage = 0.0;
+            cfg.rechargeTicks = 0;
+        }
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("weapon.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(" all stats set to 0 (blocked)").formatted(Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int weaponRemove(CommandContext<ServerCommandSource> ctx) {
+        String target = StringArgumentType.getString(ctx, "target");
+        List<String> items = resolveWeaponItems(target);
+        int removed = 0;
+        for (String itemId : items) {
+            if (WardenMod.CONFIG.weaponLimits.remove(itemId) != null) {
+                removed++;
+            }
+        }
+        WardenMod.CONFIG.save();
+        int removedCount = removed;
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("weapon.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(removedCount > 0 ? " cap disabled (default behavior: vanilla values)" : " already at default behavior (vanilla values)").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int enchantSet(CommandContext<ServerCommandSource> ctx) {
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        int level = IntegerArgumentType.getInteger(ctx, "value");
+        WardenMod.CONFIG.enchantmentLimits.put(enchId, level);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxLevel = ").formatted(Formatting.GRAY))
+                .append(Text.literal(level == -1 ? "unlimited" : String.valueOf(level)).formatted(level == -1 ? Formatting.GREEN : Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int enchantSetDefault(CommandContext<ServerCommandSource> ctx) {
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        WardenMod.CONFIG.enchantmentLimits.put(enchId, -1);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" reset to default (unlimited)").formatted(Formatting.GREEN)), true);
+        return 1;
+    }
+
+    private static int enchantDisable(CommandContext<ServerCommandSource> ctx) {
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        WardenMod.CONFIG.enchantmentLimits.put(enchId, 0);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxLevel = 0 (stripped)").formatted(Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int enchantRemove(CommandContext<ServerCommandSource> ctx) {
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        boolean had = WardenMod.CONFIG.enchantmentLimits.remove(enchId) != null;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(had ? " cap disabled (default behavior: no cap)" : " already at default behavior (no cap)").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int enchantToolSet(CommandContext<ServerCommandSource> ctx) {
+        String target = StringArgumentType.getString(ctx, "target");
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        int level = IntegerArgumentType.getInteger(ctx, "value");
+        List<String> items = resolveTargetItems(target);
+        for (String itemId : items) {
+            WardenMod.CONFIG.itemEnchantmentOverrides.computeIfAbsent(itemId, k -> new LinkedHashMap<>()).put(enchId, level);
+        }
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(".").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxLevel = ").formatted(Formatting.GRAY))
+                .append(Text.literal(level == -1 ? "unlimited" : String.valueOf(level)).formatted(level == -1 ? Formatting.GREEN : Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int enchantToolSetDefault(CommandContext<ServerCommandSource> ctx) {
+        String target = StringArgumentType.getString(ctx, "target");
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        List<String> items = resolveTargetItems(target);
+        for (String itemId : items) {
+            WardenMod.CONFIG.itemEnchantmentOverrides.computeIfAbsent(itemId, k -> new LinkedHashMap<>()).put(enchId, -1);
+        }
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(".").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" reset to default (follow global/unlimited)").formatted(Formatting.GREEN)), true);
+        return 1;
+    }
+
+    private static int enchantToolDisable(CommandContext<ServerCommandSource> ctx) {
+        String target = StringArgumentType.getString(ctx, "target");
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        List<String> items = resolveTargetItems(target);
+        for (String itemId : items) {
+            WardenMod.CONFIG.itemEnchantmentOverrides.computeIfAbsent(itemId, k -> new LinkedHashMap<>()).put(enchId, 0);
+        }
+        WardenMod.CONFIG.save();
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(".").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxLevel = 0 (stripped)").formatted(Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int enchantToolRemove(CommandContext<ServerCommandSource> ctx) {
+        String target = StringArgumentType.getString(ctx, "target");
+        String enchId = IdentifierArgumentType.getIdentifier(ctx, "enchantment").toString();
+        List<String> items = resolveTargetItems(target);
+        int removed = 0;
+        for (String itemId : items) {
+            Map<String, Integer> overrides = WardenMod.CONFIG.itemEnchantmentOverrides.get(itemId);
+            if (overrides != null && overrides.remove(enchId) != null) {
+                removed++;
+                if (overrides.isEmpty()) {
+                    WardenMod.CONFIG.itemEnchantmentOverrides.remove(itemId);
+                }
+            }
+        }
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        int removedCount = removed;
+        String label = items.size() == 1 ? items.get(0) : target + " (" + items.size() + " items)";
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchant.").formatted(Formatting.GRAY))
+                .append(Text.literal(label).formatted(Formatting.YELLOW))
+                .append(Text.literal(".").formatted(Formatting.GRAY))
+                .append(Text.literal(enchId).formatted(Formatting.YELLOW))
+                .append(Text.literal(removedCount > 0 ? " override removed (default behavior: follow global/no cap)" : " no override found (following global/no cap)").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int statusEffectAll(CommandContext<ServerCommandSource> ctx) {
+        WardenConfig cfg = WardenMod.CONFIG;
+        MutableText response = wardenPrefix().append(Text.literal("Effect limits (").formatted(Formatting.GRAY))
+                .append(Text.literal(cfg.effectLimitsEnabled ? "ENABLED" : "DISABLED").formatted(cfg.effectLimitsEnabled ? Formatting.GREEN : Formatting.RED))
+                .append(Text.literal("):").formatted(Formatting.GRAY));
+
+        if (cfg.effectLimits.isEmpty()) {
+            response.append(Text.literal("\n  (none configured)").formatted(Formatting.DARK_GRAY));
+        } else {
+            for (var e : cfg.effectLimits.entrySet()) {
+                response.append(Text.literal("\n  ").formatted(Formatting.GRAY))
+                        .append(Text.literal(e.getKey()).formatted(Formatting.YELLOW))
+                        .append(Text.literal(": maxLevel=").formatted(Formatting.GRAY))
+                        .append(Text.literal(formatEffectLevel(e.getValue().maxLevel)).formatted(Formatting.AQUA))
+                        .append(Text.literal(", maxDuration=").formatted(Formatting.GRAY))
+                        .append(Text.literal(String.valueOf(e.getValue().maxDuration)).formatted(Formatting.AQUA));
+            }
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int statusEffect(CommandContext<ServerCommandSource> ctx) {
+        String effectId = IdentifierArgumentType.getIdentifier(ctx, "effect").toString();
+        WardenConfig.EffectLimitConfig cfg = WardenMod.CONFIG.effectLimits.get(effectId);
+        if (cfg == null) {
+            ctx.getSource().sendFeedback(() -> wardenPrefix()
+                    .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                    .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                    .append(Text.literal(": not configured").formatted(Formatting.RED)), false);
+        } else {
+            ctx.getSource().sendFeedback(() -> wardenPrefix()
+                    .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                    .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                    .append(Text.literal(": maxLevel=").formatted(Formatting.GRAY))
+                    .append(Text.literal(formatEffectLevel(cfg.maxLevel)).formatted(Formatting.AQUA))
+                    .append(Text.literal(", maxDuration=").formatted(Formatting.GRAY))
+                    .append(Text.literal(String.valueOf(cfg.maxDuration)).formatted(Formatting.AQUA)), false);
+        }
+        return 1;
+    }
+
+    private static int effectSetLevel(CommandContext<ServerCommandSource> ctx) {
+        String effectId = IdentifierArgumentType.getIdentifier(ctx, "effect").toString();
+        int value = IntegerArgumentType.getInteger(ctx, "value");
+        WardenMod.CONFIG.effectLimits.computeIfAbsent(effectId, k -> new WardenConfig.EffectLimitConfig(-1, -1)).maxLevel = value;
+        cleanupEffectLimit(effectId);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxLevel = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int effectSetLevelDefault(CommandContext<ServerCommandSource> ctx) {
+        String effectId = IdentifierArgumentType.getIdentifier(ctx, "effect").toString();
+        WardenConfig.EffectLimitConfig cfg = WardenMod.CONFIG.effectLimits.get(effectId);
+        if (cfg == null) {
+            ctx.getSource().sendFeedback(() -> wardenPrefix()
+                    .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                    .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                    .append(Text.literal(" already at default behavior (no cap)").formatted(Formatting.GRAY)), true);
+            return 1;
+        }
+        cfg.maxLevel = -1;
+        cleanupEffectLimit(effectId);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" level cap disabled (default behavior: no cap)").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int effectSetDuration(CommandContext<ServerCommandSource> ctx) {
+        String effectId = IdentifierArgumentType.getIdentifier(ctx, "effect").toString();
+        int value = IntegerArgumentType.getInteger(ctx, "value");
+        WardenMod.CONFIG.effectLimits.computeIfAbsent(effectId, k -> new WardenConfig.EffectLimitConfig(-1, -1)).maxDuration = value;
+        cleanupEffectLimit(effectId);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxDuration = ").formatted(Formatting.GRAY))
+                .append(Text.literal(value + " ticks").formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int effectSetDurationDefault(CommandContext<ServerCommandSource> ctx) {
+        String effectId = IdentifierArgumentType.getIdentifier(ctx, "effect").toString();
+        WardenConfig.EffectLimitConfig cfg = WardenMod.CONFIG.effectLimits.get(effectId);
+        if (cfg == null) {
+            ctx.getSource().sendFeedback(() -> wardenPrefix()
+                    .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                    .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                    .append(Text.literal(" already at default behavior (no cap)").formatted(Formatting.GRAY)), true);
+            return 1;
+        }
+        cfg.maxDuration = -1;
+        cleanupEffectLimit(effectId);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" duration cap disabled (default behavior: no cap)").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int effectDisable(CommandContext<ServerCommandSource> ctx) {
+        String effectId = IdentifierArgumentType.getIdentifier(ctx, "effect").toString();
+        WardenConfig.EffectLimitConfig cfg = WardenMod.CONFIG.effectLimits.computeIfAbsent(
+                effectId, k -> new WardenConfig.EffectLimitConfig(0, 0));
+        cfg.maxLevel = 0;
+        cfg.maxDuration = 0;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                .append(Text.literal(" maxLevel = 0, maxDuration = 0 (blocked)").formatted(Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int effectRemove(CommandContext<ServerCommandSource> ctx) {
+        String effectId = IdentifierArgumentType.getIdentifier(ctx, "effect").toString();
+        boolean had = WardenMod.CONFIG.effectLimits.remove(effectId) != null;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("effect.").formatted(Formatting.GRAY))
+                .append(Text.literal(effectId).formatted(Formatting.YELLOW))
+                .append(Text.literal(had ? " cap disabled (default behavior: no cap)" : " already at default behavior (no cap)").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int statusXpAll(CommandContext<ServerCommandSource> ctx) {
+        MutableText response = wardenPrefix().append(Text.literal("XP Limits Status:").formatted(Formatting.GOLD));
+        response.append(Text.literal("\n  Global: ").formatted(Formatting.GRAY))
+                .append(Text.literal(WardenMod.CONFIG.xpLimitsEnabled ? "ENABLED" : "DISABLED")
+                        .formatted(WardenMod.CONFIG.xpLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+
+        if (!WardenMod.CONFIG.xpLimits.isEmpty()) {
+            response.append(Text.literal("\n  Sources:").formatted(Formatting.GOLD));
+            for (Map.Entry<String, Integer> entry : WardenMod.CONFIG.xpLimits.entrySet()) {
+                response.append(Text.literal("\n  - ").formatted(Formatting.GRAY))
+                        .append(Text.literal(entry.getKey()).formatted(Formatting.AQUA))
+                        .append(Text.literal(": ").formatted(Formatting.GRAY))
+                        .append(Text.literal(entry.getValue() == -1 ? "unlimited" : String.valueOf(entry.getValue())).formatted(entry.getValue() == -1 ? Formatting.GREEN : Formatting.YELLOW))
+                        .append(Text.literal(" maxGain").formatted(Formatting.DARK_GRAY));
+            }
+        }
+        if (!WardenMod.CONFIG.xpOverrides.isEmpty()) {
+            for (Map.Entry<String, Map<String, Integer>> sourceEntry : WardenMod.CONFIG.xpOverrides.entrySet()) {
+                response.append(Text.literal("\n  Overrides for ").formatted(Formatting.GOLD))
+                        .append(Text.literal(sourceEntry.getKey()).formatted(Formatting.AQUA))
+                        .append(Text.literal(":").formatted(Formatting.GOLD));
+                for (Map.Entry<String, Integer> entry : sourceEntry.getValue().entrySet()) {
+                    response.append(Text.literal("\n  - ").formatted(Formatting.GRAY))
+                            .append(Text.literal(WardenMod.shortId(entry.getKey())).formatted(Formatting.YELLOW))
+                            .append(Text.literal(": ").formatted(Formatting.GRAY))
+                            .append(Text.literal(entry.getValue() == -1 ? "unlimited" : String.valueOf(entry.getValue())).formatted(entry.getValue() == -1 ? Formatting.GREEN : Formatting.AQUA))
+                            .append(Text.literal(" maxGain").formatted(Formatting.DARK_GRAY));
+                }
+            }
+        }
+
+        if (WardenMod.CONFIG.xpLimits.isEmpty() && WardenMod.CONFIG.xpOverrides.isEmpty()) {
+            response.append(Text.literal("\n  No XP limits configured").formatted(Formatting.DARK_GRAY));
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int statusXpFor(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        String id = IdentifierArgumentType.getIdentifier(ctx, "id").toString();
+        Integer limit = null;
+        Map<String, Integer> sourceOverrides = WardenMod.CONFIG.xpOverrides.get(source);
+        if (sourceOverrides != null) {
+            limit = sourceOverrides.get(id);
+        }
+
+        MutableText response = wardenPrefix().append(Text.literal("XP Limit (").formatted(Formatting.GOLD))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal(" for ").formatted(Formatting.GRAY))
+                .append(Text.literal(WardenMod.shortId(id)).formatted(Formatting.YELLOW))
+                .append(Text.literal("): ").formatted(Formatting.GOLD));
+
+        if (limit == null) {
+            response.append(Text.literal("FOLLOWS SOURCE").formatted(Formatting.GRAY));
+        } else if (limit == -1) {
+            response.append(Text.literal("UNLIMITED").formatted(Formatting.GREEN));
+        } else {
+            response.append(Text.literal(String.valueOf(limit)).formatted(Formatting.YELLOW))
+                    .append(Text.literal(" maxGain").formatted(Formatting.DARK_GRAY));
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int xpSetFor(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        String id = IdentifierArgumentType.getIdentifier(ctx, "id").toString();
+        int value = IntegerArgumentType.getInteger(ctx, "value");
+        WardenMod.CONFIG.xpOverrides.computeIfAbsent(source, k -> new LinkedHashMap<>()).put(id, value);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("XP Dropped (").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal(" for ").formatted(Formatting.GRAY))
+                .append(Text.literal(WardenMod.shortId(id)).formatted(Formatting.YELLOW))
+                .append(Text.literal(") capped at ").formatted(Formatting.GRAY))
+                .append(Text.literal(value == -1 ? "unlimited" : String.valueOf(value)).formatted(value == -1 ? Formatting.GREEN : Formatting.YELLOW))
+                .append(Text.literal(" maxGain").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int xpSetDefaultFor(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        String id = IdentifierArgumentType.getIdentifier(ctx, "id").toString();
+        WardenMod.CONFIG.xpOverrides.computeIfAbsent(source, k -> new LinkedHashMap<>()).put(id, -1);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("XP Dropped (").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal(" for ").formatted(Formatting.GRAY))
+                .append(Text.literal(WardenMod.shortId(id)).formatted(Formatting.YELLOW))
+                .append(Text.literal(") reset to default (unlimited)").formatted(Formatting.GREEN)), true);
+        return 1;
+    }
+
+    private static int xpDisableFor(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        String id = IdentifierArgumentType.getIdentifier(ctx, "id").toString();
+        WardenMod.CONFIG.xpOverrides.computeIfAbsent(source, k -> new LinkedHashMap<>()).put(id, 0);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("XP Dropped (").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal(" for ").formatted(Formatting.GRAY))
+                .append(Text.literal(WardenMod.shortId(id)).formatted(Formatting.YELLOW))
+                .append(Text.literal(") disabled").formatted(Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int xpRemoveFor(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        String id = IdentifierArgumentType.getIdentifier(ctx, "id").toString();
+        Map<String, Integer> sourceOverrides = WardenMod.CONFIG.xpOverrides.get(source);
+        boolean removed = false;
+        if (sourceOverrides != null) {
+            removed = sourceOverrides.remove(id) != null;
+            if (sourceOverrides.isEmpty()) {
+                WardenMod.CONFIG.xpOverrides.remove(source);
+            }
+        }
+        final boolean had = removed;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("XP Dropped override (").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal(" for ").formatted(Formatting.GRAY))
+                .append(Text.literal(WardenMod.shortId(id)).formatted(Formatting.YELLOW))
+                .append(Text.literal(had ? ") removed (now follows " + source + ")" : ") already at default behavior").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int statusXp(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        Integer limit = WardenMod.CONFIG.xpLimits.get(source);
+
+        MutableText response = wardenPrefix().append(Text.literal("XP Limit (").formatted(Formatting.GOLD))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal("): ").formatted(Formatting.GOLD));
+
+        if (limit == null) {
+            response.append(Text.literal("DISABLED (default)").formatted(Formatting.GRAY));
+        } else if (limit == -1) {
+            response.append(Text.literal("UNLIMITED").formatted(Formatting.GREEN));
+        } else {
+            response.append(Text.literal(String.valueOf(limit)).formatted(Formatting.YELLOW))
+                    .append(Text.literal(" maxGain").formatted(Formatting.DARK_GRAY));
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int xpSet(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        int value = IntegerArgumentType.getInteger(ctx, "value");
+        WardenMod.CONFIG.xpLimits.put(source, value);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("XP Dropped (").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal(") capped at ").formatted(Formatting.GRAY))
+                .append(Text.literal(value == -1 ? "unlimited" : String.valueOf(value)).formatted(value == -1 ? Formatting.GREEN : Formatting.YELLOW))
+                .append(Text.literal(" maxGain").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int xpSetDefault(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        WardenMod.CONFIG.xpLimits.put(source, -1);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("XP Dropped (").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal(") reset to default (unlimited)").formatted(Formatting.GREEN)), true);
+        return 1;
+    }
+
+    private static int xpDisable(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        WardenMod.CONFIG.xpLimits.put(source, 0);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("XP Dropped (").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal(") disabled").formatted(Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int xpRemove(CommandContext<ServerCommandSource> ctx) {
+        String source = StringArgumentType.getString(ctx, "source");
+        boolean had = WardenMod.CONFIG.xpLimits.remove(source) != null;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("XP Dropped (").formatted(Formatting.GRAY))
+                .append(Text.literal(source).formatted(Formatting.AQUA))
+                .append(Text.literal(had ? ") cap disabled (default behavior: no cap)" : ") already at default behavior (no cap)").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int configShow(CommandContext<ServerCommandSource> ctx, String key, String value) {
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal(key).formatted(Formatting.YELLOW))
+                .append(Text.literal(" = ").formatted(Formatting.GRAY))
+                .append(Text.literal(value).formatted(Formatting.AQUA)), false);
+        return 1;
+    }
+
+    private static int configShowAll(CommandContext<ServerCommandSource> ctx) {
+        WardenConfig cfg = WardenMod.CONFIG;
+        MutableText response = wardenPrefix().append(Text.literal("Config:").formatted(Formatting.GOLD));
+        response.append(Text.literal("\n  itemLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.itemLimitsEnabled)).formatted(cfg.itemLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  explosionLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.explosionLimitsEnabled)).formatted(cfg.explosionLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  weaponLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.weaponLimitsEnabled)).formatted(cfg.weaponLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  enchantmentLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.enchantmentLimitsEnabled)).formatted(cfg.enchantmentLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  effectLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.effectLimitsEnabled)).formatted(cfg.effectLimitsEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  itemActionBarEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.itemActionBarEnabled)).formatted(cfg.itemActionBarEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  weaponActionBarEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.weaponActionBarEnabled)).formatted(cfg.weaponActionBarEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  enchantmentActionBarEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.enchantmentActionBarEnabled)).formatted(cfg.enchantmentActionBarEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  effectActionBarEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.effectActionBarEnabled)).formatted(cfg.effectActionBarEnabled ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  checkIntervalTicks = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.checkIntervalTicks)).formatted(Formatting.AQUA));
+        response.append(Text.literal("\n  dropPickupDelay = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.dropPickupDelay)).formatted(Formatting.AQUA));
+        response.append(Text.literal("\n  deleteOverflowItem = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.deleteOverflowItem)).formatted(cfg.deleteOverflowItem ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  exemptCreative = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.exemptCreative)).formatted(cfg.exemptCreative ? Formatting.GREEN : Formatting.RED));
+
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int configItemLimitsEnabled(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.itemLimitsEnabled = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("itemLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configExplosionLimitsEnabled(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.explosionLimitsEnabled = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("explosionLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configWeaponLimitsEnabled(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.weaponLimitsEnabled = value;
+        WardenMod.CONFIG.save();
+        syncWeaponRules(ctx.getSource());
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("weaponLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configEnchantmentLimitsEnabled(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.enchantmentLimitsEnabled = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchantmentLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configCheckIntervalTicks(CommandContext<ServerCommandSource> ctx) {
+        int value = IntegerArgumentType.getInteger(ctx, "value");
+        WardenMod.CONFIG.checkIntervalTicks = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("checkIntervalTicks = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int configDropPickupDelay(CommandContext<ServerCommandSource> ctx) {
+        int value = IntegerArgumentType.getInteger(ctx, "value");
+        WardenMod.CONFIG.dropPickupDelay = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("dropPickupDelay = ").formatted(Formatting.GRAY))
+                .append(Text.literal(value + " ticks").formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int configDeleteOverflowItem(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.deleteOverflowItem = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("deleteOverflowItem = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configItemActionBarEnabled(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.itemActionBarEnabled = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("itemActionBarEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configWeaponActionBarEnabled(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.weaponActionBarEnabled = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("weaponActionBarEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configEnchantmentActionBarEnabled(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.enchantmentActionBarEnabled = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("enchantmentActionBarEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configEffectActionBarEnabled(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.effectActionBarEnabled = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("effectActionBarEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configEffectLimitsEnabled(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.effectLimitsEnabled = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("effectLimitsEnabled = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int configExemptCreative(CommandContext<ServerCommandSource> ctx) {
+        boolean value = BoolArgumentType.getBool(ctx, "value");
+        WardenMod.CONFIG.exemptCreative = value;
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("exemptCreative = ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(value)).formatted(value ? Formatting.GREEN : Formatting.RED)), true);
+        return 1;
+    }
+
+    private static int statusExempt(CommandContext<ServerCommandSource> ctx) {
+        WardenConfig cfg = WardenMod.CONFIG;
+        MutableText response = wardenPrefix().append(Text.literal("Exempt config:").formatted(Formatting.GOLD));
+        response.append(Text.literal("\n  exemptCreative: ").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.exemptCreative)).formatted(cfg.exemptCreative ? Formatting.GREEN : Formatting.RED));
+        response.append(Text.literal("\n  exemptPlayers (").formatted(Formatting.GRAY))
+                .append(Text.literal(String.valueOf(cfg.exemptPlayers.size())).formatted(Formatting.AQUA))
+                .append(Text.literal("):").formatted(Formatting.GRAY));
+
+        if (cfg.exemptPlayers.isEmpty()) {
+            response.append(Text.literal("\n    (none)").formatted(Formatting.DARK_GRAY));
+        } else {
+            for (String p : cfg.exemptPlayers) {
+                response.append(Text.literal("\n    ").formatted(Formatting.GRAY))
+                        .append(Text.literal(p).formatted(Formatting.YELLOW));
+            }
+        }
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static int exemptAdd(CommandContext<ServerCommandSource> ctx) {
+        String player = StringArgumentType.getString(ctx, "player");
+        WardenMod.CONFIG.exemptPlayers.add(player);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal("Exempted: ").formatted(Formatting.GRAY))
+                .append(Text.literal(player).formatted(Formatting.AQUA)), true);
+        return 1;
+    }
+
+    private static int exemptRemove(CommandContext<ServerCommandSource> ctx) {
+        String player = StringArgumentType.getString(ctx, "player");
+        boolean had = WardenMod.CONFIG.exemptPlayers.remove(player);
+        WardenMod.CONFIG.save();
+        ctx.getSource().sendFeedback(() -> wardenPrefix()
+                .append(Text.literal(player).formatted(Formatting.AQUA))
+                .append(Text.literal(had ? " removed from exempt list" : " was not in exempt list").formatted(Formatting.GRAY)), true);
+        return 1;
+    }
+
+    private static int help(CommandContext<ServerCommandSource> ctx) {
+        MutableText response = wardenPrefix().append(Text.literal("Available Commands:").formatted(Formatting.GOLD, Formatting.BOLD));
+        
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("reload | status | help").formatted(Formatting.WHITE));
+                
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("reset ").formatted(Formatting.WHITE))
+                .append(Text.literal("[<category>]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n    Categories: ").formatted(Formatting.LIGHT_PURPLE))
+                .append(Text.literal("explosion, item, weapon, enchant, effect, xp, actionbar, exempt").formatted(Formatting.WHITE));
+
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("explosion ").formatted(Formatting.WHITE))
+                .append(Text.literal("status ").formatted(Formatting.GREEN))
+                .append(Text.literal("[<src>]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("explosion ").formatted(Formatting.WHITE))
+                .append(Text.literal("set ").formatted(Formatting.GREEN))
+                .append(Text.literal("<src> maxPower <value|default>").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("explosion ").formatted(Formatting.WHITE))
+                .append(Text.literal("disable/remove ").formatted(Formatting.RED))
+                .append(Text.literal("<src>").formatted(Formatting.YELLOW));
+
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("item ").formatted(Formatting.WHITE))
+                .append(Text.literal("status ").formatted(Formatting.GREEN))
+                .append(Text.literal("[<item>]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("item ").formatted(Formatting.WHITE))
+                .append(Text.literal("set ").formatted(Formatting.GREEN))
+                .append(Text.literal("<item> maxCount <value|default>").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("item ").formatted(Formatting.WHITE))
+                .append(Text.literal("disable/remove ").formatted(Formatting.RED))
+                .append(Text.literal("<item>").formatted(Formatting.YELLOW));
+
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("weapon ").formatted(Formatting.WHITE))
+                .append(Text.literal("status ").formatted(Formatting.GREEN))
+                .append(Text.literal("[<target>]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("weapon ").formatted(Formatting.WHITE))
+                .append(Text.literal("set ").formatted(Formatting.GREEN))
+                .append(Text.literal("<target> <stat> <value|default>").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("weapon ").formatted(Formatting.WHITE))
+                .append(Text.literal("disable/remove ").formatted(Formatting.RED))
+                .append(Text.literal("<target>").formatted(Formatting.YELLOW));
+
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("enchant ").formatted(Formatting.WHITE))
+                .append(Text.literal("status ").formatted(Formatting.GREEN))
+                .append(Text.literal("[<ench> [for <target>]]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("enchant ").formatted(Formatting.WHITE))
+                .append(Text.literal("set ").formatted(Formatting.GREEN))
+                .append(Text.literal("<ench> maxLevel <value|default> [for <target>]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("enchant ").formatted(Formatting.WHITE))
+                .append(Text.literal("disable/remove ").formatted(Formatting.RED))
+                .append(Text.literal("<ench> [for <target>]").formatted(Formatting.YELLOW));
+
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("effect ").formatted(Formatting.WHITE))
+                .append(Text.literal("status ").formatted(Formatting.GREEN))
+                .append(Text.literal("[<effect>]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("effect ").formatted(Formatting.WHITE))
+                .append(Text.literal("set ").formatted(Formatting.GREEN))
+                .append(Text.literal("<effect> maxLevel/maxDuration <value|default>").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("effect ").formatted(Formatting.WHITE))
+                .append(Text.literal("disable/remove ").formatted(Formatting.RED))
+                .append(Text.literal("<effect>").formatted(Formatting.YELLOW));
+        
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("xp ").formatted(Formatting.WHITE))
+                .append(Text.literal("status ").formatted(Formatting.GREEN))
+                .append(Text.literal("[<src> [for <id>]]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("xp ").formatted(Formatting.WHITE))
+                .append(Text.literal("set ").formatted(Formatting.GREEN))
+                .append(Text.literal("<src> maxGain <val|default> [for <id>]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("xp ").formatted(Formatting.WHITE))
+                .append(Text.literal("disable/remove ").formatted(Formatting.RED))
+                .append(Text.literal("<src> [for <id>]").formatted(Formatting.YELLOW));
+        response.append(Text.literal("\n    Sources: ").formatted(Formatting.LIGHT_PURPLE))
+                .append(Text.literal("villager_trading, entitiesKilling, blocksMining").formatted(Formatting.WHITE));
+        response.append(Text.literal("\n    Note: ").formatted(Formatting.GOLD))
+                .append(Text.literal("XP limits apply to XP Dropped from sources. Use 'for' with entitiesKilling/blocksMining.").formatted(Formatting.GRAY));
+
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("actionbar ").formatted(Formatting.WHITE))
+                .append(Text.literal("status").formatted(Formatting.GREEN));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("actionbar ").formatted(Formatting.WHITE))
+                .append(Text.literal("<item|weapon|enchantment|effect> [<true|false>]").formatted(Formatting.YELLOW));
+
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("exempt ").formatted(Formatting.WHITE))
+                .append(Text.literal("status").formatted(Formatting.GREEN));
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("exempt ").formatted(Formatting.WHITE))
+                .append(Text.literal("add/remove ").formatted(Formatting.GREEN))
+                .append(Text.literal("<player>").formatted(Formatting.YELLOW));
+
+        response.append(Text.literal("\n  /warden ").formatted(Formatting.AQUA))
+                .append(Text.literal("config ").formatted(Formatting.WHITE))
+                .append(Text.literal("<key> <value>").formatted(Formatting.YELLOW));
+
+        ctx.getSource().sendFeedback(() -> response, false);
+        return 1;
+    }
+
+    private static String formatWeaponConfig(WardenConfig.WeaponLimitConfig cfg) {
+        List<String> parts = new ArrayList<>();
+        if (cfg.attackDamage != null) {
+            parts.add("damage=" + cfg.attackDamage);
+        }
+        if (cfg.attackSpeed != null) {
+            parts.add("attackSpeed=" + cfg.attackSpeed);
+        }
+        if (cfg.reach != null) {
+            parts.add("reach=" + cfg.reach);
+        }
+        if (cfg.disableCooldownTicks != null) {
+            parts.add("disableCooldown=" + cfg.disableCooldownTicks + " ticks");
+        }
+        if (cfg.projectileDamage != null) {
+            parts.add("projectileDamage=" + cfg.projectileDamage);
+        }
+        if (cfg.rechargeTicks != null) {
+            parts.add("rechargeTime=" + cfg.rechargeTicks + " ticks");
+        }
+        return parts.isEmpty() ? "not configured" : String.join(", ", parts);
+    }
+
+    private static boolean cleanupEffectLimit(String effectId) {
+        WardenConfig.EffectLimitConfig cfg = WardenMod.CONFIG.effectLimits.get(effectId);
+        if (cfg != null && cfg.maxLevel == -1 && cfg.maxDuration == -1) {
+            WardenMod.CONFIG.effectLimits.remove(effectId);
+            return true;
+        }
+        return false;
+    }
+
+    private static String formatEffectLevel(int level) {
+        return level < 0 ? "default" : String.valueOf(level);
+    }
+
+    private static void validateWeaponStatTarget(String stat, String target, List<String> items)
+            throws com.mojang.brigadier.exceptions.CommandSyntaxException {
+        boolean valid = switch (stat) {
+            case "attackDamage", "attackSpeed", "reach", "disableCooldown" ->
+                    items.stream().allMatch(WardenCommand::isMeleeWeaponTarget);
+            case "projectileDamage", "rechargeTime" ->
+                    items.stream().allMatch(WardenCommand::isRangedWeaponTarget);
+            default -> true;
+        };
+        if (!valid) {
+            String expected = switch (stat) {
+                case "attackDamage", "attackSpeed", "reach", "disableCooldown" ->
+                        "damage, attackSpeed, reach, and disableCooldown only apply to melee weapons (sword, axe, mace, spear, trident)";
+                case "projectileDamage", "rechargeTime" ->
+                        "projectileDamage and rechargeTime only apply to ranged weapons (bow, crossbow, trident)";
+                default -> "invalid weapon stat target";
+            };
+            throw INVALID_WEAPON_STAT_TARGET.create(expected + ": " + target);
+        }
+    }
+
+    private static boolean clearWeaponStat(WardenConfig.WeaponLimitConfig cfg, String stat) {
+        if ("attackDamage".equals(stat) && cfg.attackDamage != null) {
+            cfg.attackDamage = null;
+            return true;
+        }
+        if ("attackSpeed".equals(stat) && cfg.attackSpeed != null) {
+            cfg.attackSpeed = null;
+            return true;
+        }
+        if ("reach".equals(stat) && cfg.reach != null) {
+            cfg.reach = null;
+            return true;
+        }
+        if ("disableCooldown".equals(stat) && cfg.disableCooldownTicks != null) {
+            cfg.disableCooldownTicks = null;
+            return true;
+        }
+        if ("projectileDamage".equals(stat) && cfg.projectileDamage != null) {
+            cfg.projectileDamage = null;
+            return true;
+        }
+        if ("rechargeTime".equals(stat) && cfg.rechargeTicks != null) {
+            cfg.rechargeTicks = null;
+            return true;
+        }
+        return false;
+    }
+
+    private static void setWeaponStat(WardenConfig.WeaponLimitConfig cfg, String stat, float value) {
+        if ("attackDamage".equals(stat)) {
+            cfg.attackDamage = (double) value;
+        } else if ("attackSpeed".equals(stat)) {
+            cfg.attackSpeed = (double) value;
+        } else if ("reach".equals(stat)) {
+            cfg.reach = value;
+        }
+    }
+
+    private static Item getItem(String itemId) {
+        Identifier identifier = Identifier.of(itemId);
+        return Registries.ITEM.containsId(identifier) ? Registries.ITEM.get(identifier) : null;
+    }
+
+    private static Double getVanillaWeaponDouble(Item item, String stat) {
+        if ("attackDamage".equals(stat)) {
+            return WardenMod.getVanillaAttackDamage(item);
+        }
+        if ("attackSpeed".equals(stat)) {
+            return WardenMod.getVanillaAttackSpeed(item);
+        }
+        return null;
+    }
+
+    private static Float getVanillaWeaponFloat(Item item, String stat) {
+        if ("reach".equals(stat)) {
+            return WardenMod.getVanillaReach(item);
+        }
+        return null;
+    }
+
+    private static boolean approximatelyEquals(double a, double b) {
+        return Math.abs(a - b) < 0.0001;
+    }
+}

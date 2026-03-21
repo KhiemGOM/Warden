@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd /c \"gradlew.bat build 2>&1\")",
+      "Bash(./gradlew build:*)",
+      "Bash(winget --version)",
+      "Bash(winget install:*)",
+      "Bash(JAVA_HOME=\"/c/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot\" PATH=\"/c/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin:$PATH\" ./gradlew build --no-daemon)",
+      "Bash(winget search:*)",
+      "Bash(JAVA_HOME=\"/c/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot\" PATH=\"/c/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin:$PATH\" GRADLE_OPTS=\"-Djava.io.tmpdir=C:/temp\" ./gradlew build --no-daemon)",
+      "Bash(JAVA_HOME=\"/c/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot\" PATH=\"/c/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin:$PATH\" ./gradlew build --no-daemon --info)",
+      "Bash(1 xargs:*)",
+      "Bash(1 uname:*)",
+      "Bash(JAVA_HOME=\"C:\\\\Program Files\\\\Eclipse Adoptium\\\\jdk-21.0.10.7-hotspot\" GRADLE_OPTS=\"-Djava.io.tmpdir=C:/temp\" cmd /c \"gradlew.bat build --no-daemon 2>&1\")",
+      "Bash(JAVA_HOME=\"C:\\\\Program Files\\\\Eclipse Adoptium\\\\jdk-21.0.10.7-hotspot\" GRADLE_OPTS=\"-Djava.io.tmpdir=C:/temp\" cmd /c gradlew.bat build --no-daemon)",
+      "Bash(JAVA_HOME=\"C:\\\\Program Files\\\\Eclipse Adoptium\\\\jdk-21.0.10.7-hotspot\" GRADLE_OPTS=\"-Djava.io.tmpdir=C:/temp\" powershell.exe -Command \":*)",
+      "Bash(powershell.exe -Command \":*)",
+      "Bash(cd /tmp)",
+      "Bash(\"/c/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin/jar\" xf \"C:/Users/Omen 16 2023/.gradle/caches/fabric-loom/1.21.11/net.fabricmc.yarn.1_21_11.1.21.11+build.4-v2/mappings.jar\" mappings/mappings.tiny)",
+      "Bash(grep -v \"^--$\")",
+      "Bash(jar tf:*)",
+      "Bash(set \"TEMP=C:\\\\temp\")",
+      "Bash(set \"TMP=C:\\\\temp\")",
+      "Bash(set \"JAVA_HOME=C:/Program Files/Eclipse Adoptium/jdk-21.0.7+6\")",
+      "Bash(cmd /c \"gradlew.bat build --no-daemon 2>&1\")",
+      "Bash(TEMP=\"C:/temp\" TMP=\"C:/temp\" JAVA_HOME=\"C:/Program Files/Eclipse Adoptium/jdk-21.0.7+6\" ./gradlew build --no-daemon)",
+      "Bash(TEMP=\"C:/temp\" TMP=\"C:/temp\" JAVA_HOME=\"/c/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot\" ./gradlew build --no-daemon)",
+      "Bash(TEMP=\"C:/temp\" TMP=\"C:/temp\" JAVA_HOME=\"/c/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot\" ./gradlew clean build --no-daemon)",
+      "Bash(grep -n \"class\\\\|interface\\\\|package\" d:/Coding/Java/serverlimits-template-1.21.11/src/main/java/com/serverlimits/*.java)",
+      "Bash(where java:*)",
+      "Bash(cd \"D:/Coding/Java/serverlimits-template-1.21.11\" && JAVA_HOME=\"C:/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot\" ./gradlew build 2>&1)",
+      "Bash(powershell -Command \"[System.Environment]::SetEnvironmentVariable\\('JAVA_HOME', 'C:\\\\Program Files\\\\Eclipse Adoptium\\\\jdk-21.0.10.7-hotspot', 'User'\\)\")",
+      "mcp__ide__getDiagnostics"
+    ]
+  }
+}
