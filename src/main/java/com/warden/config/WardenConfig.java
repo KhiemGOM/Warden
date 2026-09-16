@@ -6,6 +6,10 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.registry.RegistryKeys;
+import net.minecraft.util.Identifier;
+import net.minecraft.world.World;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -15,6 +19,7 @@ import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -33,6 +38,9 @@ public class WardenConfig {
     public int dropPickupDelay = 60;
     public boolean deleteOverflowItem = false;
     public Map<String, Integer> itemLimits = new LinkedHashMap<>();
+
+    public boolean itemUsageEnabled = true;
+    public Set<String> blockedItemUsage = new LinkedHashSet<>();
 
     public boolean weaponLimitsEnabled = true;
     public Map<String, WeaponLimitConfig> weaponLimits = new LinkedHashMap<>();
@@ -55,8 +63,30 @@ public class WardenConfig {
     public boolean xpActionBarEnabled = true;
     public Map<String, Set<String>> playerActionBarDisabled = new LinkedHashMap<>();
 
+    public boolean dimensionLimitsEnabled = true;
+    public Set<String> blockedDimensions = new LinkedHashSet<>();
+    // registry keys are interned, so this is an identity lookup with no string work per check
+    public transient Set<RegistryKey<World>> blockedDimensionKeys = Set.of();
+
     public boolean exemptCreative = true;
     public Set<String> exemptPlayers = new LinkedHashSet<>();
+
+    // scrambles loot-table seeds rolled during world generation so they can't be used to
+    // brute-force the world seed; see com.warden.seed.SeedHash
+    public boolean antiSeedCrackEnabled = true;
+
+    // chunk-ban guard: strips items / block entities whose encoded size could push a packet past
+    // the client's 2 MB frame limit and disconnect everyone who loads the chunk
+    public boolean chunkBanEnabled = true;
+    public int maxItemBytes = 65536;
+    public int maxBlockEntityBytes = 32768;
+    public int maxChunkBlockEntityBytes = 1048576;
+
+    // bucket-drain guard: refuses further source-block pickups once a player fills more than
+    // maxBucketDrains buckets within bucketDrainWindowTicks
+    public boolean bucketDrainEnabled = true;
+    public int maxBucketDrains = 6;
+    public int bucketDrainWindowTicks = 100;
 
     public static class ExplosionSourceConfig {
         public boolean enabled;
@@ -138,6 +168,17 @@ public class WardenConfig {
         populateDefaults();
     }
 
+    public JsonObject toJsonObject() {
+        return toJson();
+    }
+
+    public static WardenConfig fromJson(JsonObject root) {
+        WardenConfig config = new WardenConfig();
+        config.readFrom(root);
+        config.normalize();
+        return config;
+    }
+
     public boolean resetCategory(String category) {
         switch (category) {
             case "explosion" -> {
@@ -150,6 +191,10 @@ public class WardenConfig {
                 dropPickupDelay = 60;
                 deleteOverflowItem = false;
                 itemLimits.clear();
+            }
+            case "usage" -> {
+                itemUsageEnabled = true;
+                blockedItemUsage.clear();
             }
             case "weapon" -> {
                 weaponLimitsEnabled = true;
@@ -173,11 +218,29 @@ public class WardenConfig {
                 weaponActionBarEnabled = true;
                 enchantmentActionBarEnabled = true;
                 effectActionBarEnabled = true;
+                xpActionBarEnabled = true;
                 playerActionBarDisabled.clear();
+            }
+            case "dimension" -> {
+                dimensionLimitsEnabled = true;
+                blockedDimensions.clear();
+                blockedDimensionKeys = Set.of();
             }
             case "exempt" -> {
                 exemptCreative = true;
                 exemptPlayers.clear();
+            }
+            case "anticrack" -> antiSeedCrackEnabled = true;
+            case "chunkban" -> {
+                chunkBanEnabled = true;
+                maxItemBytes = 65536;
+                maxBlockEntityBytes = 32768;
+                maxChunkBlockEntityBytes = 1048576;
+            }
+            case "bucketdrain" -> {
+                bucketDrainEnabled = true;
+                maxBucketDrains = 6;
+                bucketDrainWindowTicks = 100;
             }
             default -> {
                 return false;
@@ -196,6 +259,9 @@ public class WardenConfig {
         deleteOverflowItem = false;
         itemLimits.clear();
 
+        itemUsageEnabled = true;
+        blockedItemUsage.clear();
+
         weaponLimitsEnabled = true;
         weaponLimits.clear();
 
@@ -212,8 +278,19 @@ public class WardenConfig {
         xpLimits.clear();
         xpOverrides.clear();
         playerActionBarDisabled.clear();
+        dimensionLimitsEnabled = true;
+        blockedDimensions.clear();
+        blockedDimensionKeys = Set.of();
         exemptCreative = true;
         exemptPlayers.clear();
+        antiSeedCrackEnabled = true;
+        chunkBanEnabled = true;
+        maxItemBytes = 65536;
+        maxBlockEntityBytes = 32768;
+        maxChunkBlockEntityBytes = 1048576;
+        bucketDrainEnabled = true;
+        maxBucketDrains = 6;
+        bucketDrainWindowTicks = 100;
     }
 
     private void readFrom(JsonObject root) {
@@ -241,6 +318,17 @@ public class WardenConfig {
                 JsonObject itemMap = items.getAsJsonObject("items");
                 for (Map.Entry<String, JsonElement> entry : itemMap.entrySet()) {
                     itemLimits.put(entry.getKey(), entry.getValue().getAsInt());
+                }
+            }
+        }
+
+        if (root.has("item_usage")) {
+            JsonObject usage = root.getAsJsonObject("item_usage");
+            itemUsageEnabled = getBool(usage, "enabled", true);
+            if (usage.has("blocked")) {
+                for (JsonElement item : usage.getAsJsonArray("blocked")) {
+                    Identifier id = Identifier.tryParse(item.getAsString().trim());
+                    if (id != null) blockedItemUsage.add(id.toString());
                 }
             }
         }
@@ -358,6 +446,36 @@ public class WardenConfig {
             }
         }
 
+        if (root.has("dimension_limits")) {
+            JsonObject dims = root.getAsJsonObject("dimension_limits");
+            dimensionLimitsEnabled = getBool(dims, "enabled", true);
+            blockedDimensions.clear();
+            if (dims.has("blocked")) {
+                for (JsonElement el : dims.getAsJsonArray("blocked")) {
+                    blockedDimensions.add(el.getAsString());
+                }
+            }
+        }
+
+        if (root.has("anti_seedcrack")) {
+            antiSeedCrackEnabled = getBool(root.getAsJsonObject("anti_seedcrack"), "enabled", true);
+        }
+
+        if (root.has("chunk_ban")) {
+            JsonObject cb = root.getAsJsonObject("chunk_ban");
+            chunkBanEnabled = getBool(cb, "enabled", true);
+            maxItemBytes = cb.has("max_item_bytes") ? cb.get("max_item_bytes").getAsInt() : 65536;
+            maxBlockEntityBytes = cb.has("max_block_entity_bytes") ? cb.get("max_block_entity_bytes").getAsInt() : 32768;
+            maxChunkBlockEntityBytes = cb.has("max_chunk_block_entity_bytes") ? cb.get("max_chunk_block_entity_bytes").getAsInt() : 1048576;
+        }
+
+        if (root.has("bucket_drain")) {
+            JsonObject bd = root.getAsJsonObject("bucket_drain");
+            bucketDrainEnabled = getBool(bd, "enabled", true);
+            maxBucketDrains = bd.has("max_drains") ? bd.get("max_drains").getAsInt() : 6;
+            bucketDrainWindowTicks = bd.has("window_ticks") ? bd.get("window_ticks").getAsInt() : 100;
+        }
+
         if (root.has("exempt")) {
             JsonObject ex = root.getAsJsonObject("exempt");
             exemptCreative = getBool(ex, "creative", true);
@@ -396,6 +514,13 @@ public class WardenConfig {
         }
         itemSection.add("items", itemMap);
         root.add("item_limits", itemSection);
+
+        JsonObject usageSection = new JsonObject();
+        usageSection.addProperty("enabled", itemUsageEnabled);
+        JsonArray usageItems = new JsonArray();
+        blockedItemUsage.forEach(usageItems::add);
+        usageSection.add("blocked", usageItems);
+        root.add("item_usage", usageSection);
 
         JsonObject weaponSection = new JsonObject();
         weaponSection.addProperty("enabled", weaponLimitsEnabled);
@@ -496,6 +621,15 @@ public class WardenConfig {
         actionBarSection.add("players", playerActionBar);
         root.add("action_bar", actionBarSection);
 
+        JsonObject dimSection = new JsonObject();
+        dimSection.addProperty("enabled", dimensionLimitsEnabled);
+        JsonArray blockedArr = new JsonArray();
+        for (String d : blockedDimensions) {
+            blockedArr.add(d);
+        }
+        dimSection.add("blocked", blockedArr);
+        root.add("dimension_limits", dimSection);
+
         JsonObject exemptSection = new JsonObject();
         exemptSection.addProperty("creative", exemptCreative);
         JsonArray playersArr = new JsonArray();
@@ -505,10 +639,28 @@ public class WardenConfig {
         exemptSection.add("players", playersArr);
         root.add("exempt", exemptSection);
 
+        JsonObject antiCrackSection = new JsonObject();
+        antiCrackSection.addProperty("enabled", antiSeedCrackEnabled);
+        root.add("anti_seedcrack", antiCrackSection);
+
+        JsonObject chunkBanSection = new JsonObject();
+        chunkBanSection.addProperty("enabled", chunkBanEnabled);
+        chunkBanSection.addProperty("max_item_bytes", maxItemBytes);
+        chunkBanSection.addProperty("max_block_entity_bytes", maxBlockEntityBytes);
+        chunkBanSection.addProperty("max_chunk_block_entity_bytes", maxChunkBlockEntityBytes);
+        root.add("chunk_ban", chunkBanSection);
+
+        JsonObject bucketDrainSection = new JsonObject();
+        bucketDrainSection.addProperty("enabled", bucketDrainEnabled);
+        bucketDrainSection.addProperty("max_drains", maxBucketDrains);
+        bucketDrainSection.addProperty("window_ticks", bucketDrainWindowTicks);
+        root.add("bucket_drain", bucketDrainSection);
+
         return root;
     }
 
     private void normalize() {
+        checkIntervalTicks = Math.max(1, checkIntervalTicks);
         weaponLimits.entrySet().removeIf(entry -> {
             WeaponLimitConfig cfg = entry.getValue();
             return cfg == null || !cfg.isConfigured();
@@ -524,6 +676,18 @@ public class WardenConfig {
         });
 
         playerActionBarDisabled.entrySet().removeIf(entry -> entry.getValue() == null || entry.getValue().isEmpty());
+
+        Set<RegistryKey<World>> keys = new HashSet<>();
+        blockedDimensions.removeIf(id -> {
+            Identifier ident = Identifier.tryParse(id);
+            if (ident == null) {
+                LOGGER.warn("[Warden] ignoring invalid dimension id in config: {}", id);
+                return true;
+            }
+            keys.add(RegistryKey.of(RegistryKeys.WORLD, ident));
+            return false;
+        });
+        blockedDimensionKeys = keys.isEmpty() ? Set.of() : Set.copyOf(keys);
     }
 
     private static boolean getBool(JsonObject obj, String key, boolean def) {
